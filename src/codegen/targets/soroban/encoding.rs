@@ -1867,7 +1867,7 @@ fn encode_struct_map(
             expr: Box::new(item.clone()),
             member: index,
         };
-        let value = if matches!(field.ty, Type::Struct(_)) {
+        let value = if field.ty.is_fixed_reference_type(ns) {
             member
         } else {
             Expression::Load {
@@ -1927,7 +1927,7 @@ fn encode_struct_storage(
             expr: Box::new(item.clone()),
             member: index,
         };
-        let loaded = if matches!(field_ty, Type::Struct(_)) {
+        let loaded = if field_ty.is_fixed_reference_type(ns) {
             member
         } else {
             Expression::Load {
@@ -1991,11 +1991,19 @@ fn encode_vector(
         var_no: arr_no,
     };
 
-    let len = Expression::Builtin {
-        loc,
-        tys: vec![Type::Uint(32)],
-        kind: Builtin::ArrayLength,
-        args: vec![arr.clone()],
+    let len = if let Some(fixed_len) = item_ty.array_length() {
+        Expression::NumberLiteral {
+            loc,
+            ty: Type::Uint(32),
+            value: fixed_len.clone(),
+        }
+    } else {
+        Expression::Builtin {
+            loc,
+            tys: vec![Type::Uint(32)],
+            kind: Builtin::ArrayLength,
+            args: vec![arr.clone()],
+        }
     };
 
     let vec_no = vartab.temp_name("vec_obj", &Type::Uint(64));
@@ -2579,35 +2587,43 @@ fn decode_vector(
         var_no: handle_no,
     };
 
-    let len_val = vartab.temp_name("vec_len", &Type::Uint(64));
-    cfg.add(
-        vartab,
-        host_call(vec![len_val], HostFunctions::VecLen, vec![handle.clone()]),
-    );
-    let count = soroban_decode_arg(
+    let count_var = if let Some(fixed_len) = array_ty.array_length() {
+        Expression::NumberLiteral {
+            loc,
+            ty: Type::Uint(32),
+            value: fixed_len.clone(),
+        }
+    } else {
+        let len_val = vartab.temp_name("vec_len", &Type::Uint(64));
+        cfg.add(
+            vartab,
+            host_call(vec![len_val], HostFunctions::VecLen, vec![handle.clone()]),
+        );
+        let count = soroban_decode_arg(
+            Expression::Variable {
+                loc,
+                ty: Type::Uint(64),
+                var_no: len_val,
+            },
+            cfg,
+            vartab,
+            ns,
+            Some(Type::Uint(32)),
+        );
+        let count_no = vartab.temp_name("vec_count", &Type::Uint(32));
+        cfg.add(
+            vartab,
+            Instr::Set {
+                loc,
+                res: count_no,
+                expr: count,
+            },
+        );
         Expression::Variable {
             loc,
-            ty: Type::Uint(64),
-            var_no: len_val,
-        },
-        cfg,
-        vartab,
-        ns,
-        Some(Type::Uint(32)),
-    );
-    let count_no = vartab.temp_name("vec_count", &Type::Uint(32));
-    cfg.add(
-        vartab,
-        Instr::Set {
-            loc,
-            res: count_no,
-            expr: count,
-        },
-    );
-    let count_var = Expression::Variable {
-        loc,
-        ty: Type::Uint(32),
-        var_no: count_no,
+            ty: Type::Uint(32),
+            var_no: count_no,
+        }
     };
 
     let buffer_no = vartab.temp_name("vec_decoded", array_ty);
