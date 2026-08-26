@@ -114,6 +114,16 @@ impl HostFunctions {
                 .i64_type()
                 .fn_type(&[ty.into(), ty.into()], false),
 
+            HostFunctions::MapDel => bin
+                .context
+                .i64_type()
+                .fn_type(&[ty.into(), ty.into()], false),
+
+            HostFunctions::MapHas => bin
+                .context
+                .i64_type()
+                .fn_type(&[ty.into(), ty.into()], false),
+
             HostFunctions::VecPushBack => bin
                 .context
                 .i64_type()
@@ -538,6 +548,8 @@ impl SorobanTarget {
             HostFunctions::MapNew,
             HostFunctions::MapPut,
             HostFunctions::MapGet,
+            HostFunctions::MapDel,
+            HostFunctions::MapHas,
             HostFunctions::VecPushBack,
             HostFunctions::VecGet,
             HostFunctions::VecPut,

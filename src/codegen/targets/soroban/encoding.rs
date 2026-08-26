@@ -1936,7 +1936,7 @@ fn encode_struct_storage(
                 expr: Box::new(member),
             }
         };
-        let encoded = soroban_encode_arg(loaded, cfg, vartab, ns);
+        let encoded = soroban_storage_encode_arg(loaded, cfg, vartab, ns);
 
         let prev_vec = Expression::Variable {
             loc,
@@ -2184,7 +2184,7 @@ fn decode_struct_storage(
             var_no: elem_no,
         };
 
-        let decoded = soroban_decode_arg(elem, cfg, vartab, ns, Some(ty.clone()));
+        let decoded = soroban_storage_decode_arg(elem, cfg, vartab, ns, Some(ty.clone()));
         members.push(decoded);
     }
 
