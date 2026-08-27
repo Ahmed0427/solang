@@ -14,8 +14,8 @@ use self::encoding::{
 };
 use self::events::SorobanEventEmitter;
 use self::storage_path::{
-    is_descent_storage_expr, lower_storage_path, path_delete, path_load, path_load_map, path_store,
-    Idx,
+    is_descent_storage_expr, lower_storage_path, path_delete_map, path_load, path_load_map,
+    path_store, Idx,
 };
 use crate::codegen::cfg::{ASTFunction, ControlFlowGraph, Instr, InternalCallTy};
 use crate::codegen::error::CodegenError;
@@ -1093,11 +1093,9 @@ pub(crate) fn soroban_storage_assign(
     Some(value)
 }
 
-/// Lower `delete m[k]` for a mapping leaf to a `map_del` on the storage path.
-/// Returns `true` if it handled the delete; `false` (leaving the generic
-/// `ClearStorage` path) for any non-mapping-leaf target.
 pub(crate) fn soroban_storage_delete(
     expr: &ast::Expression,
+    ty: &Type,
     cfg: &mut ControlFlowGraph,
     contract_no: usize,
     func: Option<&Function>,
@@ -1111,10 +1109,14 @@ pub(crate) fn soroban_storage_delete(
     }
     let (_, path, storage_type) =
         lower_storage_path(expr, cfg, contract_no, func, ns, vartab, opt, target);
-    if !matches!(path.idxs.last(), Some(Idx::Map { .. })) {
-        return false;
+    match path.idxs.last() {
+        Some(Idx::Map { .. }) => path_delete_map(&path, &storage_type, cfg, vartab, ns),
+        Some(Idx::Field(_) | Idx::Array(_)) => {
+            let def = soroban_default_handle(&expr.loc(), ty, cfg, vartab, ns);
+            path_store(&path, def, &storage_type, cfg, vartab, ns);
+        }
+        None => return false,
     }
-    path_delete(&path, &storage_type, cfg, vartab, ns);
     true
 }
 
@@ -1138,9 +1140,6 @@ pub(crate) fn soroban_storage_load(
     if !is_bytes_subscript && is_descent_storage_expr(base) {
         let (_, path, storage_type) =
             lower_storage_path(base, cfg, contract_no, func, ns, vartab, opt, target);
-        // Mapping paths cannot use the trap-on-miss `path_load` fold: any absent
-        // level collapses the read to `default(V)`. Use the map-aware read walk,
-        // which short-circuits on absence (§6.4).
         let handle = if path.idxs.iter().any(|i| matches!(i, Idx::Map { .. })) {
             path_load_map(&path, ty, &storage_type, cfg, vartab, ns)
         } else {

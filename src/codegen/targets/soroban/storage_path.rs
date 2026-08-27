@@ -478,7 +478,7 @@ pub(crate) fn path_store(
     );
 }
 
-pub(crate) fn path_delete(
+pub(crate) fn path_delete_map(
     loc: &Loc,
     storage_type: &Option<pt::StorageType>,
     cfg: &mut ControlFlowGraph,
@@ -487,7 +487,7 @@ pub(crate) fn path_delete(
 ) {
     let ploc = pt::Loc::Codegen;
     let n = loc.idxs.len();
-    debug_assert!(n >= 1, "path_delete requires at least one index");
+    debug_assert!(n >= 1, "path_delete_map requires at least one index");
 
     let encoded: Vec<Expression> = loc
         .idxs
@@ -515,6 +515,28 @@ pub(crate) fn path_delete(
         handles.push(h);
     }
 
+    let has = map_has(
+        &ploc,
+        handles[n - 1].clone(),
+        encoded[n - 1].clone(),
+        cfg,
+        vartab,
+    );
+
+    vartab.new_dirty_tracker();
+    let present = cfg.new_basic_block("map_del_present".to_string());
+    let done = cfg.new_basic_block("map_del_done".to_string());
+
+    cfg.add(
+        vartab,
+        Instr::BranchCond {
+            cond: is_true(has),
+            true_block: present,
+            false_block: done,
+        },
+    );
+
+    cfg.set_basic_block(present);
     let mut new_root = map_del(
         &ploc,
         handles[n - 1].clone(),
@@ -541,4 +563,8 @@ pub(crate) fn path_delete(
             storage_type: storage_type.clone(),
         },
     );
+    cfg.add(vartab, Instr::Branch { block: done });
+
+    cfg.set_basic_block(done);
+    cfg.set_phis(done, vartab.pop_dirty_tracker());
 }

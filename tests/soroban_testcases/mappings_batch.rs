@@ -749,6 +749,41 @@ fn map_delete_nested() {
 }
 
 #[test]
+fn map_delete_absent_key() {
+    let src = r#"
+        contract c {
+            mapping(uint64 => uint64) m;
+            mapping(uint64 => mapping(uint64 => uint64)) n;
+            function set(uint64 k, uint64 v) public { m[k] = v; }
+            function get(uint64 k) public view returns (uint64) { return m[k]; }
+            function del(uint64 k) public { delete m[k]; }
+            function del_nested(uint64 a, uint64 b) public { delete n[a][b]; }
+        }
+    "#;
+    let runtime = build_solidity(src, |_| {});
+    let env = &runtime.env;
+    let addr = runtime.contracts.last().unwrap();
+
+    let zero: Val = 0u64.into_val(env);
+
+    runtime.invoke_contract(addr, "del", vec![7u64.into_val(env)]);
+    let got = runtime.invoke_contract(addr, "get", vec![7u64.into_val(env)]);
+    assert!(zero.shallow_eq(&got), "absent key still 0 after delete");
+
+    runtime.invoke_contract(addr, "set", vec![7u64.into_val(env), 42u64.into_val(env)]);
+    runtime.invoke_contract(addr, "del", vec![8u64.into_val(env)]);
+    let got = runtime.invoke_contract(addr, "get", vec![7u64.into_val(env)]);
+    let e42: Val = 42u64.into_val(env);
+    assert!(e42.shallow_eq(&got), "neighbour intact after absent delete");
+
+    runtime.invoke_contract(
+        addr,
+        "del_nested",
+        vec![99u64.into_val(env), 1u64.into_val(env)],
+    );
+}
+
+#[test]
 fn map_nested_uint_keys() {
     let src = r#"
         contract c {
@@ -1796,4 +1831,113 @@ fn map_cross_tx_persistence() {
         e200.shallow_eq(&runtime.invoke_contract(addr, "get", vec![b.into_val(env)])),
         "b persists independently"
     );
+}
+
+#[test]
+fn delete_array_element() {
+    let src = r#"
+        contract c {
+            uint64[] a;
+            function push(uint64 v) public { a.push(v); }
+            function get(uint64 i) public view returns (uint64) { return a[i]; }
+            function len() public view returns (uint64) { return uint64(a.length); }
+            function del(uint64 i) public { delete a[i]; }
+        }
+    "#;
+    let runtime = build_solidity(src, |_| {});
+    let env = &runtime.env;
+    let addr = runtime.contracts.last().unwrap();
+
+    for v in [10u64, 20, 30, 40] {
+        runtime.invoke_contract(addr, "push", vec![v.into_val(env)]);
+    }
+
+    runtime.invoke_contract(addr, "del", vec![1u64.into_val(env)]);
+
+    let get = |i: u64| runtime.invoke_contract(addr, "get", vec![i.into_val(env)]);
+    let z: Val = 0u64.into_val(env);
+    let e10: Val = 10u64.into_val(env);
+    let e30: Val = 30u64.into_val(env);
+    let e40: Val = 40u64.into_val(env);
+    assert!(e10.shallow_eq(&get(0)), "a[0] intact");
+    assert!(z.shallow_eq(&get(1)), "a[1] reset to default");
+    assert!(e30.shallow_eq(&get(2)), "a[2] intact");
+    assert!(e40.shallow_eq(&get(3)), "a[3] intact");
+
+    let four: Val = 4u64.into_val(env);
+    assert!(
+        four.shallow_eq(&runtime.invoke_contract(addr, "len", vec![])),
+        "length unchanged by element delete"
+    );
+}
+
+#[test]
+fn delete_struct_field() {
+    let src = r#"
+        contract c {
+            struct S { uint64 x; uint64 y; }
+            S s;
+            function set(uint64 x, uint64 y) public { s.x = x; s.y = y; }
+            function getx() public view returns (uint64) { return s.x; }
+            function gety() public view returns (uint64) { return s.y; }
+            function delx() public { delete s.x; }
+        }
+    "#;
+    let runtime = build_solidity(src, |_| {});
+    let env = &runtime.env;
+    let addr = runtime.contracts.last().unwrap();
+
+    runtime.invoke_contract(addr, "set", vec![7u64.into_val(env), 9u64.into_val(env)]);
+    runtime.invoke_contract(addr, "delx", vec![]);
+
+    let z: Val = 0u64.into_val(env);
+    let e9: Val = 9u64.into_val(env);
+    assert!(
+        z.shallow_eq(&runtime.invoke_contract(addr, "getx", vec![])),
+        "s.x reset to default"
+    );
+    assert!(
+        e9.shallow_eq(&runtime.invoke_contract(addr, "gety", vec![])),
+        "s.y intact"
+    );
+}
+
+#[test]
+fn delete_mapping_value_struct_field() {
+    let src = r#"
+        contract c {
+            struct S { uint64 x; uint64 y; }
+            mapping(uint64 => S) m;
+            function set(uint64 k, uint64 x, uint64 y) public { m[k].x = x; m[k].y = y; }
+            function getx(uint64 k) public view returns (uint64) { return m[k].x; }
+            function gety(uint64 k) public view returns (uint64) { return m[k].y; }
+            function delx(uint64 k) public { delete m[k].x; }
+        }
+    "#;
+    let runtime = build_solidity(src, |_| {});
+    let env = &runtime.env;
+    let addr = runtime.contracts.last().unwrap();
+
+    let set = |k: u64, x: u64, y: u64| {
+        runtime.invoke_contract(
+            addr,
+            "set",
+            vec![k.into_val(env), x.into_val(env), y.into_val(env)],
+        );
+    };
+    set(1, 11, 12);
+    set(2, 21, 22);
+
+    runtime.invoke_contract(addr, "delx", vec![1u64.into_val(env)]);
+
+    let getx = |k: u64| runtime.invoke_contract(addr, "getx", vec![k.into_val(env)]);
+    let gety = |k: u64| runtime.invoke_contract(addr, "gety", vec![k.into_val(env)]);
+    let z: Val = 0u64.into_val(env);
+    let e12: Val = 12u64.into_val(env);
+    let e21: Val = 21u64.into_val(env);
+    let e22: Val = 22u64.into_val(env);
+    assert!(z.shallow_eq(&getx(1)), "m[1].x reset to default");
+    assert!(e12.shallow_eq(&gety(1)), "m[1].y intact");
+    assert!(e21.shallow_eq(&getx(2)), "m[2].x intact");
+    assert!(e22.shallow_eq(&gety(2)), "m[2].y intact");
 }

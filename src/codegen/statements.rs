@@ -220,11 +220,10 @@ pub(crate) fn statement(
             let _ = expression(expr, cfg, contract_no, Some(func), ns, vartab, opt, target);
         }
         Statement::Delete(_, ty, expr) => {
-            // Soroban mappings are one MapObject per slot: `delete m[k]` is a
-            // `map_del` on the storage path, not a slot `ClearStorage`.
             if ns.target == Target::Soroban
                 && soroban_storage_delete(
                     expr,
+                    ty,
                     cfg,
                     contract_no,
                     Some(func),
