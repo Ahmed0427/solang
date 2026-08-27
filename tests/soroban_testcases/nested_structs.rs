@@ -268,7 +268,6 @@ fn nested_field_init_via_flat_substruct() {
 }
 
 #[test]
-#[ignore = "nested struct whole-literal init ICEs in encode_struct_storage (pre-existing encode gap)"]
 fn nested_whole_literal_init_ice() {
     let src = r#"
         contract c {

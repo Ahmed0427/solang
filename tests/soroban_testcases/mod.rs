@@ -32,6 +32,7 @@ mod integer_width_warnings;
 mod keccak256;
 mod liquidity_pool;
 mod mappings;
+mod mappings_batch;
 mod math;
 mod nested_structs;
 mod print;

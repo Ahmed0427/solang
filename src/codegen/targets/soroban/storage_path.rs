@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::encoding::soroban_encode_arg;
-use super::soroban_field_index_val;
+use super::map::{is_true, map_del, map_get, map_get_or_default, map_has, map_put};
+use super::{soroban_default_handle, soroban_field_index_val};
 use crate::codegen::cfg::{ControlFlowGraph, Instr, InternalCallTy};
 use crate::codegen::expression::expression;
 use crate::codegen::interface::TargetCodegen;
@@ -16,6 +17,11 @@ use solang_parser::pt;
 pub(crate) enum Idx {
     Field(usize),
     Array(Box<Expression>),
+    Map {
+        key: Box<Expression>,
+        key_ty: Box<Type>,
+        val_ty: Box<Type>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -31,10 +37,26 @@ pub(crate) fn is_array_descent(array_ty: &Type) -> bool {
     }
 }
 
+pub(crate) fn is_map_descent(array_ty: &Type) -> bool {
+    matches!(array_ty, Type::StorageRef(_, inner) if matches!(inner.as_ref(), Type::Mapping(_)))
+}
+
+fn map_key_val_ty(array_ty: &Type) -> (Type, Type) {
+    match array_ty {
+        Type::StorageRef(_, inner) => match inner.as_ref() {
+            Type::Mapping(m) => ((*m.key).clone(), (*m.value).clone()),
+            _ => unreachable!("map_key_val_ty: not a mapping"),
+        },
+        _ => unreachable!("map_key_val_ty: not a storage ref"),
+    }
+}
+
 pub(crate) fn is_descent_storage_expr(e: &ast::Expression) -> bool {
     match e {
         ast::Expression::StructMember { ty, .. } => ty.is_contract_storage(),
-        ast::Expression::Subscript { array_ty, .. } => is_array_descent(array_ty),
+        ast::Expression::Subscript { array_ty, .. } => {
+            is_array_descent(array_ty) || is_map_descent(array_ty)
+        }
         _ => false,
     }
 }
@@ -99,6 +121,24 @@ pub(crate) fn lower_storage_lvalue(
                 index: Box::new(idx),
             }
         }
+        ast::Expression::Subscript {
+            loc,
+            ty,
+            array_ty,
+            array,
+            index,
+        } if is_map_descent(array_ty) => {
+            let inner =
+                lower_storage_lvalue(array, cfg, contract_no, func, ns, vartab, opt, target);
+            let key = expression(index, cfg, contract_no, func, ns, vartab, opt, target);
+            Expression::Subscript {
+                loc: *loc,
+                ty: ty.clone(),
+                array_ty: array_ty.clone(),
+                expr: Box::new(inner),
+                index: Box::new(key),
+            }
+        }
         _ => expression(left, cfg, contract_no, func, ns, vartab, opt, target),
     }
 }
@@ -142,6 +182,20 @@ pub(crate) fn peel(expr: &Expression) -> Loc {
                 ..
             } if is_array_descent(array_ty) => {
                 idxs_rev.push(Idx::Array(index.clone()));
+                cur = inner;
+            }
+            Expression::Subscript {
+                expr: inner,
+                index,
+                array_ty,
+                ..
+            } if is_map_descent(array_ty) => {
+                let (key_ty, val_ty) = map_key_val_ty(array_ty);
+                idxs_rev.push(Idx::Map {
+                    key: index.clone(),
+                    key_ty: Box::new(key_ty),
+                    val_ty: Box::new(val_ty),
+                });
                 cur = inner;
             }
             _ => break,
@@ -233,6 +287,9 @@ fn encode_index(
         Idx::Array(index) => {
             soroban_encode_arg((**index).clone().cast(&Type::Uint(32), ns), cfg, vartab, ns)
         }
+        Idx::Map { key, key_ty, .. } => {
+            soroban_encode_arg((**key).clone().cast(key_ty, ns), cfg, vartab, ns)
+        }
     }
 }
 
@@ -289,6 +346,76 @@ fn vec_put(
     }
 }
 
+pub(crate) fn path_load_map(
+    loc: &Loc,
+    value_ty: &Type,
+    storage_type: &Option<pt::StorageType>,
+    cfg: &mut ControlFlowGraph,
+    vartab: &mut Vartable,
+    ns: &Namespace,
+) -> Expression {
+    let ploc = pt::Loc::Codegen;
+    let res_no = vartab.temp_name("map_read", &Type::Uint(64));
+    let result = Expression::Variable {
+        loc: ploc,
+        ty: Type::Uint(64),
+        var_no: res_no,
+    };
+
+    vartab.new_dirty_tracker();
+    let absent = cfg.new_basic_block("map_read_absent".to_string());
+    let merge = cfg.new_basic_block("map_read_merge".to_string());
+
+    let mut cur = load_root(&ploc, loc.root_key.clone(), storage_type, cfg, vartab);
+    for idx in &loc.idxs {
+        let idx_val = encode_index(&ploc, idx, cfg, vartab, ns);
+        match idx {
+            Idx::Map { .. } => {
+                let has = map_has(&ploc, cur.clone(), idx_val.clone(), cfg, vartab);
+                let hit = cfg.new_basic_block("map_read_hit".to_string());
+                cfg.add(
+                    vartab,
+                    Instr::BranchCond {
+                        cond: is_true(has),
+                        true_block: hit,
+                        false_block: absent,
+                    },
+                );
+                cfg.set_basic_block(hit);
+                cur = map_get(&ploc, cur, idx_val, cfg, vartab);
+            }
+            Idx::Field(_) | Idx::Array(_) => {
+                cur = vec_get(&ploc, cur, idx_val, cfg, vartab);
+            }
+        }
+    }
+    cfg.add(
+        vartab,
+        Instr::Set {
+            loc: ploc,
+            res: res_no,
+            expr: cur,
+        },
+    );
+    cfg.add(vartab, Instr::Branch { block: merge });
+
+    cfg.set_basic_block(absent);
+    let def = soroban_default_handle(&ploc, value_ty, cfg, vartab, ns);
+    cfg.add(
+        vartab,
+        Instr::Set {
+            loc: ploc,
+            res: res_no,
+            expr: def,
+        },
+    );
+    cfg.add(vartab, Instr::Branch { block: merge });
+
+    cfg.set_basic_block(merge);
+    cfg.set_phis(merge, vartab.pop_dirty_tracker());
+    result
+}
+
 pub(crate) fn path_store(
     loc: &Loc,
     value: Expression,
@@ -317,25 +444,26 @@ pub(crate) fn path_store(
             vartab,
         ));
         for k in 1..n {
-            let h = vec_get(
-                &ploc,
-                handles[k - 1].clone(),
-                encoded[k - 1].clone(),
-                cfg,
-                vartab,
-            );
+            let parent = handles[k - 1].clone();
+            let addr = encoded[k - 1].clone();
+            let h = match &loc.idxs[k - 1] {
+                Idx::Map { val_ty, .. } => {
+                    map_get_or_default(&ploc, parent, addr, val_ty, cfg, vartab, ns)
+                }
+                Idx::Field(_) | Idx::Array(_) => vec_get(&ploc, parent, addr, cfg, vartab),
+            };
             handles.push(h);
         }
 
         for k in (0..n).rev() {
-            new_root = vec_put(
-                &ploc,
-                handles[k].clone(),
-                encoded[k].clone(),
-                new_root,
-                cfg,
-                vartab,
-            );
+            let parent = handles[k].clone();
+            let addr = encoded[k].clone();
+            new_root = match &loc.idxs[k] {
+                Idx::Map { .. } => map_put(&ploc, parent, addr, new_root, cfg, vartab),
+                Idx::Field(_) | Idx::Array(_) => {
+                    vec_put(&ploc, parent, addr, new_root, cfg, vartab)
+                }
+            };
         }
     }
 
@@ -348,4 +476,95 @@ pub(crate) fn path_store(
             storage_type: storage_type.clone(),
         },
     );
+}
+
+pub(crate) fn path_delete_map(
+    loc: &Loc,
+    storage_type: &Option<pt::StorageType>,
+    cfg: &mut ControlFlowGraph,
+    vartab: &mut Vartable,
+    ns: &Namespace,
+) {
+    let ploc = pt::Loc::Codegen;
+    let n = loc.idxs.len();
+    debug_assert!(n >= 1, "path_delete_map requires at least one index");
+
+    let encoded: Vec<Expression> = loc
+        .idxs
+        .iter()
+        .map(|idx| encode_index(&ploc, idx, cfg, vartab, ns))
+        .collect();
+
+    let mut handles = Vec::with_capacity(n);
+    handles.push(load_root(
+        &ploc,
+        loc.root_key.clone(),
+        storage_type,
+        cfg,
+        vartab,
+    ));
+    for k in 1..n {
+        let parent = handles[k - 1].clone();
+        let addr = encoded[k - 1].clone();
+        let h = match &loc.idxs[k - 1] {
+            Idx::Map { val_ty, .. } => {
+                map_get_or_default(&ploc, parent, addr, val_ty, cfg, vartab, ns)
+            }
+            Idx::Field(_) | Idx::Array(_) => vec_get(&ploc, parent, addr, cfg, vartab),
+        };
+        handles.push(h);
+    }
+
+    let has = map_has(
+        &ploc,
+        handles[n - 1].clone(),
+        encoded[n - 1].clone(),
+        cfg,
+        vartab,
+    );
+
+    vartab.new_dirty_tracker();
+    let present = cfg.new_basic_block("map_del_present".to_string());
+    let done = cfg.new_basic_block("map_del_done".to_string());
+
+    cfg.add(
+        vartab,
+        Instr::BranchCond {
+            cond: is_true(has),
+            true_block: present,
+            false_block: done,
+        },
+    );
+
+    cfg.set_basic_block(present);
+    let mut new_root = map_del(
+        &ploc,
+        handles[n - 1].clone(),
+        encoded[n - 1].clone(),
+        cfg,
+        vartab,
+    );
+
+    for k in (0..n - 1).rev() {
+        let parent = handles[k].clone();
+        let addr = encoded[k].clone();
+        new_root = match &loc.idxs[k] {
+            Idx::Map { .. } => map_put(&ploc, parent, addr, new_root, cfg, vartab),
+            Idx::Field(_) | Idx::Array(_) => vec_put(&ploc, parent, addr, new_root, cfg, vartab),
+        };
+    }
+
+    cfg.add(
+        vartab,
+        Instr::SetStorage {
+            ty: Type::Uint(64),
+            value: new_root,
+            storage: loc.root_key.clone(),
+            storage_type: storage_type.clone(),
+        },
+    );
+    cfg.add(vartab, Instr::Branch { block: done });
+
+    cfg.set_basic_block(done);
+    cfg.set_phis(done, vartab.pop_dirty_tracker());
 }

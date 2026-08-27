@@ -366,74 +366,16 @@ impl<'a> TargetRuntime<'a> for SorobanTarget {
 
     fn storage_subscript(
         &self,
-        bin: &Binary<'a>,
+        _bin: &Binary<'a>,
         _function: FunctionValue<'a>,
         _ty: &Type,
-        slot: IntValue<'a>,
-        index: BasicValueEnum<'a>,
+        _slot: IntValue<'a>,
+        _index: BasicValueEnum<'a>,
     ) -> IntValue<'a> {
-        // Storage arrays are read/written in codegen now (arrays.rs, vec_get/vec_put).
-        // This path still serves other subscript storage (e.g. mappings): the key is a
-        // VecObject of [slot, index].
-        let vec_new = bin
-            .builder
-            .build_call(
-                bin.module
-                    .get_function(HostFunctions::VectorNew.name())
-                    .unwrap(),
-                &[],
-                "vec_new",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-
-        // push the slot to the vector as U32Val
-        let slot_encoded = encode_value(
-            if slot.get_type().get_bit_width() == 64 {
-                slot
-            } else {
-                bin.builder
-                    .build_int_z_extend(slot, bin.context.i64_type(), "slot64")
-                    .unwrap()
-            },
-            32,
-            4,
-            bin,
-        );
-        let res = bin
-            .builder
-            .build_call(
-                bin.module
-                    .get_function(HostFunctions::VecPushBack.name())
-                    .unwrap(),
-                &[vec_new.as_basic_value_enum().into(), slot_encoded.into()],
-                "push",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-
-        // push the index to the vector
-        let res = bin
-            .builder
-            .build_call(
-                bin.module
-                    .get_function(HostFunctions::VecPushBack.name())
-                    .unwrap(),
-                &[res.as_basic_value_enum().into(), index.into()],
-                "push",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-        res
+        // All storage subscripts (arrays and mappings) are lowered in codegen now
+        // (storage_path.rs: vec_get/vec_put for arrays, map_get/map_put for
+        // mappings), so no `Subscript` storage expression reaches emit.
+        unsupported_soroban(Loc::Codegen, "storage subscript")
     }
 
     fn storage_push(

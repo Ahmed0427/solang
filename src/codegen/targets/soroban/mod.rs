@@ -5,6 +5,7 @@ pub(crate) mod bytes;
 pub(crate) mod dispatch;
 pub(crate) mod encoding;
 pub(crate) mod events;
+pub(crate) mod map;
 pub(crate) mod storage_path;
 
 use self::encoding::{
@@ -12,7 +13,10 @@ use self::encoding::{
     soroban_storage_decode_arg, soroban_storage_encode_arg,
 };
 use self::events::SorobanEventEmitter;
-use self::storage_path::{is_descent_storage_expr, lower_storage_path, path_load, path_store};
+use self::storage_path::{
+    is_descent_storage_expr, lower_storage_path, path_delete_map, path_load, path_load_map,
+    path_store, Idx,
+};
 use crate::codegen::cfg::{ASTFunction, ControlFlowGraph, Instr, InternalCallTy};
 use crate::codegen::error::CodegenError;
 use crate::codegen::expression::{expression, load_storage, storage_type};
@@ -123,6 +127,7 @@ impl TargetCodegen for SorobanTarget {
             Type::Struct(StructType::UserDefined(_)) => {
                 Some(soroban_default_handle(loc, ty, cfg, vartab, ns))
             }
+            Type::Mapping(..) => Some(soroban_default_handle(loc, ty, cfg, vartab, ns)),
             _ => None,
         }
     }
@@ -1088,6 +1093,33 @@ pub(crate) fn soroban_storage_assign(
     Some(value)
 }
 
+pub(crate) fn soroban_storage_delete(
+    expr: &ast::Expression,
+    ty: &Type,
+    cfg: &mut ControlFlowGraph,
+    contract_no: usize,
+    func: Option<&Function>,
+    ns: &Namespace,
+    vartab: &mut Vartable,
+    opt: &Options,
+    target: &dyn TargetCodegen,
+) -> bool {
+    if !is_descent_storage_expr(expr) {
+        return false;
+    }
+    let (_, path, storage_type) =
+        lower_storage_path(expr, cfg, contract_no, func, ns, vartab, opt, target);
+    match path.idxs.last() {
+        Some(Idx::Map { .. }) => path_delete_map(&path, &storage_type, cfg, vartab, ns),
+        Some(Idx::Field(_) | Idx::Array(_)) => {
+            let def = soroban_default_handle(&expr.loc(), ty, cfg, vartab, ns);
+            path_store(&path, def, &storage_type, cfg, vartab, ns);
+        }
+        None => return false,
+    }
+    true
+}
+
 pub(crate) fn soroban_storage_load(
     loc: &pt::Loc,
     base: &ast::Expression,
@@ -1108,7 +1140,11 @@ pub(crate) fn soroban_storage_load(
     if !is_bytes_subscript && is_descent_storage_expr(base) {
         let (_, path, storage_type) =
             lower_storage_path(base, cfg, contract_no, func, ns, vartab, opt, target);
-        let handle = path_load(&path, &storage_type, cfg, vartab, ns);
+        let handle = if path.idxs.iter().any(|i| matches!(i, Idx::Map { .. })) {
+            path_load_map(&path, ty, &storage_type, cfg, vartab, ns)
+        } else {
+            path_load(&path, &storage_type, cfg, vartab, ns)
+        };
         return soroban_storage_decode_arg(handle, cfg, vartab, ns, Some(ty.clone()));
     }
 
@@ -1785,6 +1821,7 @@ pub(crate) fn soroban_default_handle(
         Type::Array(..) if ty.array_length().is_some() => {
             soroban_fixed_array_default_vec(loc, ty, cfg, vartab, ns)
         }
+        Type::Mapping(..) => map::soroban_map_new(loc, ty, cfg, vartab),
         _ => unreachable!("Type has no default storage value"),
     }
 }
