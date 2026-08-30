@@ -1121,6 +1121,7 @@ fn try_load_and_cast(
         }
         Type::Ref(ty) => match *ty {
             Type::Array(_, _) => expr.cast(to_ty, ns),
+            Type::Struct(_) if ns.target == Target::Soroban => expr.cast(to_ty, ns),
             _ => Expression::Load {
                 loc: pt::Loc::Builtin,
                 ty: *ty,

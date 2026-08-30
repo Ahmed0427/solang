@@ -297,7 +297,11 @@ pub fn soroban_storage_encode_arg(
     vartab: &mut Vartable,
     ns: &Namespace,
 ) -> Expression {
-    match item.ty() {
+    let ty = match item.ty() {
+        Type::Ref(inner) => *inner,
+        other => other,
+    };
+    match ty {
         Type::Struct(StructType::UserDefined(n)) => encode_struct_storage(item, cfg, vartab, ns, n),
         Type::Array(..) => encode_vector(item, cfg, vartab, ns, true),
         _ => soroban_encode_arg(item, cfg, vartab, ns),
