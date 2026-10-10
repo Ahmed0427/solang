@@ -2895,6 +2895,13 @@ fn runtime_cast<'a>(
 
             let dest = bin.build_alloca(function, llvm_ty, "dest");
 
+            // The address may be narrower than the integer.
+            bin.builder
+                .build_store(dest, llvm_ty.into_int_type().const_zero())
+                .unwrap_or_else(|err| {
+                    panic!("{}", CodegenError::llvm_builder("emitting expression", err))
+                });
+
             let len = bin
                 .context
                 .i32_type()
