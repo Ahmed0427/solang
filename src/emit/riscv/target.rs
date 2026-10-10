@@ -98,6 +98,8 @@ impl RiscvTargetRuntime {
                     .builder
                     .build_alloca(bin.address_type(), "address")
                     .unwrap();
+                // It is reloaded as an i160, and SP1 traps on misaligned loads.
+                tmp.as_instruction().unwrap().set_alignment(8).unwrap();
                 bin.builder
                     .build_store(tmp, value.into_array_value())
                     .unwrap();
