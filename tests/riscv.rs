@@ -125,6 +125,7 @@ fn object_exports_entry_points_and_imports_syscalls() {
     assert_eq!(
         undefined,
         set(&[
+            "__sys_callvalue",
             "__sys_return",
             "__sys_revert",
             "__sys_sload",

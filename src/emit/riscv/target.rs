@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::codegen::Builtin;
 use crate::emit::binary::Binary;
 use crate::emit::{ContractArgs, HashTy, TargetRuntime, Variable};
 use crate::sema::ast::{ArrayLength, CallTy, Type};
@@ -519,15 +520,19 @@ pub(crate) fn declare_syscalls(bin: &mut Binary) {
     let return_fn = bin.module.add_function("__sys_return", return_ty, None);
     return_fn.set_linkage(Linkage::External);
 
-    let caller_ty = void_ty.fn_type(&[i8_ptr_ty.into()], false);
-    let caller = bin.module.add_function("__sys_caller", caller_ty, None);
-    caller.set_linkage(Linkage::External);
-
-    let callvalue_ty = void_ty.fn_type(&[i8_ptr_ty.into()], false);
-    let callvalue = bin
-        .module
-        .add_function("__sys_callvalue", callvalue_ty, None);
-    callvalue.set_linkage(Linkage::External);
+    // The transaction context: each writes to its out pointer, or returns.
+    for name in ["__sys_caller", "__sys_callvalue", "__sys_address"] {
+        let ty = void_ty.fn_type(&[i8_ptr_ty.into()], false);
+        bin.module
+            .add_function(name, ty, None)
+            .set_linkage(Linkage::External);
+    }
+    for name in ["__sys_block_number", "__sys_timestamp"] {
+        let ty = i64_ty.fn_type(&[], false);
+        bin.module
+            .add_function(name, ty, None)
+            .set_linkage(Linkage::External);
+    }
 
     let revert_ty = void_ty.fn_type(&[i8_ptr_ty.into(), i64_ty.into()], false);
     let revert = bin.module.add_function("__sys_revert", revert_ty, None);
@@ -601,9 +606,25 @@ impl<'a> TargetRuntime<'a> for RiscvTargetRuntime {
         bin.builder.build_unreachable().unwrap();
     }
 
-    fn value_transferred<'b>(&self, contract: &Binary<'b>) -> IntValue<'b> {
-        let i256_ty = contract.context.custom_width_int_type(256);
-        i256_ty.const_zero()
+    fn value_transferred<'b>(&self, bin: &Binary<'b>) -> IntValue<'b> {
+        let i256_ty = bin.context.custom_width_int_type(256);
+        let function = bin
+            .builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .unwrap();
+        let out = bin.build_alloca(function, i256_ty, "value");
+        bin.builder
+            .build_call(
+                bin.module.get_function("__sys_callvalue").unwrap(),
+                &[out.into()],
+                "",
+            )
+            .unwrap();
+        bin.builder
+            .build_load(i256_ty, out, "value")
+            .unwrap()
+            .into_int_value()
     }
 
     fn storage_delete(
@@ -844,12 +865,41 @@ impl<'a> TargetRuntime<'a> for RiscvTargetRuntime {
 
     fn builtin<'b>(
         &self,
-        _bin: &Binary<'b>,
-        _expr: &crate::codegen::Expression,
+        bin: &Binary<'b>,
+        expr: &crate::codegen::Expression,
         _vartab: &HashMap<usize, Variable<'b>>,
-        _function: FunctionValue<'b>,
+        function: FunctionValue<'b>,
     ) -> BasicValueEnum<'b> {
-        unimplemented!("builtin")
+        let crate::codegen::Expression::Builtin { kind, .. } = expr else {
+            unreachable!("builtin is only called with builtins");
+        };
+        let address = |name: &str| {
+            let out = bin.build_alloca(function, bin.address_type(), "address");
+            bin.builder
+                .build_call(bin.module.get_function(name).unwrap(), &[out.into()], "")
+                .unwrap();
+            out
+        };
+        let number = |name: &str| {
+            bin.builder
+                .build_call(bin.module.get_function(name).unwrap(), &[], name)
+                .unwrap()
+                .try_as_basic_value()
+                .left()
+                .unwrap()
+        };
+        match kind {
+            Builtin::Sender => bin
+                .builder
+                .build_load(bin.address_type(), address("__sys_caller"), "caller")
+                .unwrap(),
+            // Codegen loads it: GetAddress is a pointer to the address.
+            Builtin::GetAddress => address("__sys_address").into(),
+            Builtin::Value => self.value_transferred(bin).into(),
+            Builtin::BlockNumber => number("__sys_block_number"),
+            Builtin::Timestamp => number("__sys_timestamp"),
+            _ => unimplemented!("the riscv target has no syscall for {kind:?} yet"),
+        }
     }
 
     fn emit_event<'b>(
