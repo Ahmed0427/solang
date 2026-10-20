@@ -174,6 +174,9 @@ impl<'a> Dispatch<'a> {
             matches!(func_cfg.ty, FunctionTy::Constructor) && func_cfg.public
         });
 
+        // solc's implicit constructor is not payable either.
+        self.abort_if_value_transfer(constructor.is_none_or(|(_, cfg)| cfg.nonpayable));
+
         if let Some((func_no, _)) = constructor {
             let args = self.decode_args(func_no, self.input_len_expr());
             self.add(Instr::Call {
@@ -320,6 +323,7 @@ impl<'a> Dispatch<'a> {
     fn dispatch_case(&mut self, func_no: usize) -> usize {
         let case_bb = self.cfg.new_basic_block(format!("func_{func_no}_dispatch"));
         self.cfg.set_basic_block(case_bb);
+        self.abort_if_value_transfer(self.all_cfg[func_no].nonpayable);
 
         let args = self.decode_args(func_no, self.input_len_expr());
 
@@ -359,6 +363,39 @@ impl<'a> Dispatch<'a> {
         }
 
         case_bb
+    }
+
+    /// Revert, as solc does, when a function that is not payable gets value.
+    fn abort_if_value_transfer(&mut self, nonpayable: bool) {
+        if !nonpayable {
+            return;
+        }
+        let value_ty = self.ns.value_type();
+        let got_value = self.cfg.new_basic_block("got_value".into());
+        let no_value = self.cfg.new_basic_block("no_value".into());
+        self.add(Instr::BranchCond {
+            cond: Expression::NotEqual {
+                loc: Codegen,
+                left: Expression::Builtin {
+                    loc: Codegen,
+                    tys: vec![value_ty.clone()],
+                    kind: Builtin::Value,
+                    args: vec![],
+                }
+                .into(),
+                right: Expression::NumberLiteral {
+                    loc: Codegen,
+                    ty: value_ty,
+                    value: 0.into(),
+                }
+                .into(),
+            },
+            true_block: got_value,
+            false_block: no_value,
+        });
+        self.cfg.set_basic_block(got_value);
+        self.add(Instr::AssertFailure { encoded_args: None });
+        self.cfg.set_basic_block(no_value);
     }
 
     fn return_empty(&mut self) {
