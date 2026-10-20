@@ -20,6 +20,10 @@ fn have_llc() -> bool {
 }
 
 fn compile_incrementer() -> Vec<u8> {
+    compile_testcase("incrementer.sol")
+}
+
+fn compile_testcase(file: &str) -> Vec<u8> {
     let mut resolver = FileResolver::default();
     resolver.add_import_path(std::path::Path::new("tests/contract_testcases/riscv"));
     let opt = Options {
@@ -27,7 +31,7 @@ fn compile_incrementer() -> Vec<u8> {
         ..Default::default()
     };
     let (outputs, ns) = compile(
-        OsStr::new("incrementer.sol"),
+        OsStr::new(file),
         &mut resolver,
         Target::Riscv,
         &opt,
@@ -126,5 +130,25 @@ fn object_exports_entry_points_and_imports_syscalls() {
             "__sys_sload",
             "__sys_sstore"
         ])
+    );
+}
+
+#[test]
+fn mapping_contract_imports_keccak() {
+    if !have_llc() {
+        return;
+    }
+    let elf = compile_testcase("balances.sol");
+
+    assert_eq!(u32_at(&elf, 0x30), 0, "e_flags: no compressed, soft-float");
+    let at = elf.windows(5).position(|w| w == b"rv64i").expect("arch");
+    let arch = c_str(&elf, at);
+    assert!(!arch.contains("_a") && !arch.contains("_c"), "{arch}");
+
+    let (_, undefined) = global_symbols(&elf);
+    assert!(undefined.contains("__sys_keccak256"), "{undefined:?}");
+    assert!(
+        undefined.iter().all(|name| name.starts_with("__sys_")),
+        "{undefined:?}"
     );
 }
