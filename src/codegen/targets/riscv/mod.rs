@@ -2,6 +2,7 @@
 
 pub(crate) mod dispatch;
 pub(crate) mod encoding;
+pub(crate) mod events;
 
 use crate::codegen::cfg::ControlFlowGraph;
 use crate::codegen::interface::{EventEmitter, TargetCodegen};
@@ -9,28 +10,9 @@ use crate::codegen::storage::{array_pop, array_push};
 use crate::codegen::vartable::Vartable;
 use crate::codegen::{Expression, Options};
 use crate::sema::ast::{self, Function, Namespace, StructType, Type};
+use events::RiscvEventEmitter;
 use num_bigint::BigInt;
 use solang_parser::pt::{self, Loc};
-
-pub(crate) struct RiscvEventEmitter;
-
-impl EventEmitter for RiscvEventEmitter {
-    fn emit(
-        &self,
-        _contract_no: usize,
-        _func: &crate::sema::ast::Function,
-        _cfg: &mut ControlFlowGraph,
-        _vartab: &mut Vartable,
-        _opt: &Options,
-        _target: &dyn TargetCodegen,
-    ) {
-        // TODO: events are dropped until the Log syscall is wired up
-    }
-
-    fn selector(&self, _emitting_contract_no: usize) -> Vec<u8> {
-        vec![]
-    }
-}
 
 pub(crate) struct RiscvTarget;
 
@@ -108,11 +90,11 @@ impl TargetCodegen for RiscvTarget {
     fn event_emitter<'a>(
         &self,
         _loc: &pt::Loc,
-        _event_no: usize,
-        _args: &'a [ast::Expression],
-        _ns: &'a Namespace,
+        event_no: usize,
+        args: &'a [ast::Expression],
+        ns: &'a Namespace,
     ) -> Box<dyn EventEmitter + 'a> {
-        Box::new(RiscvEventEmitter)
+        Box::new(RiscvEventEmitter { args, ns, event_no })
     }
 
     fn lower_storage_struct_member(
