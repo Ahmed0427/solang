@@ -538,6 +538,37 @@ pub(crate) fn declare_syscalls(bin: &mut Binary) {
     let revert = bin.module.add_function("__sys_revert", revert_ty, None);
     revert.set_linkage(Linkage::External);
 
+    // Calls to other contracts: 0 if the callee returned, 1 if it reverted.
+    let call_ty = i64_ty.fn_type(
+        &[
+            i8_ptr_ty.into(),
+            i8_ptr_ty.into(),
+            i8_ptr_ty.into(),
+            i64_ty.into(),
+        ],
+        false,
+    );
+    bin.module
+        .add_function("__sys_call", call_ty, None)
+        .set_linkage(Linkage::External);
+    let call_no_value_ty =
+        i64_ty.fn_type(&[i8_ptr_ty.into(), i8_ptr_ty.into(), i64_ty.into()], false);
+    for name in ["__sys_staticcall", "__sys_delegatecall"] {
+        bin.module
+            .add_function(name, call_no_value_ty, None)
+            .set_linkage(Linkage::External);
+    }
+    bin.module
+        .add_function("__sys_returndata_size", i64_ty.fn_type(&[], false), None)
+        .set_linkage(Linkage::External);
+    bin.module
+        .add_function(
+            "__sys_returndata_copy",
+            void_ty.fn_type(&[i8_ptr_ty.into(), i64_ty.into(), i64_ty.into()], false),
+            None,
+        )
+        .set_linkage(Linkage::External);
+
     let log_ty = void_ty.fn_type(
         &[
             i8_ptr_ty.into(),
@@ -973,19 +1004,80 @@ impl<'a> TargetRuntime<'a> for RiscvTargetRuntime {
             .unwrap();
     }
 
+    /// The status goes to `success` as codegen expects it on this target: 0
+    /// if the callee returned, 2 if it reverted. Without `success` (a plain
+    /// `other.f()`), a revert is passed on with the callee's revert data, as
+    /// solc does.
     fn external_call<'b>(
         &self,
-        _bin: &Binary<'b>,
-        _function: FunctionValue<'b>,
-        _success: Option<&mut BasicValueEnum<'b>>,
-        _payload: PointerValue<'b>,
-        _payload_len: IntValue<'b>,
-        _address: Option<BasicValueEnum<'b>>,
-        _contract_args: ContractArgs<'b>,
-        _ty: CallTy,
+        bin: &Binary<'b>,
+        function: FunctionValue<'b>,
+        success: Option<&mut BasicValueEnum<'b>>,
+        payload: PointerValue<'b>,
+        payload_len: IntValue<'b>,
+        address: Option<BasicValueEnum<'b>>,
+        contract_args: ContractArgs<'b>,
+        ty: CallTy,
         _loc: Loc,
     ) {
-        unimplemented!("external_call")
+        let i64_ty = bin.context.i64_type();
+        let address = address.unwrap().into_pointer_value();
+        let len = bin
+            .builder
+            .build_int_z_extend(payload_len, i64_ty, "payload_len")
+            .unwrap();
+        let mut args: Vec<BasicMetadataValueEnum> = vec![address.into()];
+        let name = match ty {
+            CallTy::Regular => {
+                let value =
+                    bin.build_alloca(function, bin.context.custom_width_int_type(256), "value");
+                bin.builder
+                    .build_store(value, contract_args.value.unwrap())
+                    .unwrap();
+                args.push(value.into());
+                "__sys_call"
+            }
+            CallTy::Static => "__sys_staticcall",
+            CallTy::Delegate => "__sys_delegatecall",
+        };
+        args.push(payload.into());
+        args.push(len.into());
+        let status = bin
+            .builder
+            .build_call(bin.module.get_function(name).unwrap(), &args, "status")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+
+        if let Some(success) = success {
+            let code = bin
+                .builder
+                .build_int_truncate(status, bin.context.i32_type(), "status")
+                .unwrap();
+            *success = bin
+                .builder
+                .build_int_mul(code, bin.context.i32_type().const_int(2, false), "status")
+                .unwrap()
+                .into();
+            return;
+        }
+
+        let reverted = bin
+            .builder
+            .build_int_compare(IntPredicate::NE, status, i64_ty.const_zero(), "reverted")
+            .unwrap();
+        let bubble = bin.context.append_basic_block(function, "callee_reverted");
+        let done = bin.context.append_basic_block(function, "callee_returned");
+        bin.builder
+            .build_conditional_branch(reverted, bubble, done)
+            .unwrap();
+        bin.builder.position_at_end(bubble);
+        let data = self.return_data(bin, function);
+        let data_len = bin.vector_len(data.into());
+        self.assert_failure(bin, bin.vector_bytes(data.into()), data_len);
+        bin.builder.position_at_end(done);
     }
 
     fn create_contract<'b>(
@@ -1015,8 +1107,40 @@ impl<'a> TargetRuntime<'a> for RiscvTargetRuntime {
         unimplemented!("value_transfer")
     }
 
-    fn return_data<'b>(&self, _bin: &Binary<'b>, _function: FunctionValue<'b>) -> PointerValue<'b> {
-        unimplemented!("return_data")
+    /// The return data of the last call, copied into a new `bytes`.
+    fn return_data<'b>(&self, bin: &Binary<'b>, _function: FunctionValue<'b>) -> PointerValue<'b> {
+        let i64_ty = bin.context.i64_type();
+        let size = bin
+            .builder
+            .build_call(
+                bin.module.get_function("__sys_returndata_size").unwrap(),
+                &[],
+                "returndata_size",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+        let len = bin
+            .builder
+            .build_int_truncate(size, bin.context.i32_type(), "returndata_len")
+            .unwrap();
+        let data = bin
+            .vector_new(len, bin.context.i32_type().const_int(1, false), None)
+            .into_pointer_value();
+        bin.builder
+            .build_call(
+                bin.module.get_function("__sys_returndata_copy").unwrap(),
+                &[
+                    bin.vector_bytes(data.into()).into(),
+                    i64_ty.const_zero().into(),
+                    size.into(),
+                ],
+                "",
+            )
+            .unwrap();
+        data
     }
 
     fn selfdestruct<'b>(&self, _binary: &Binary<'b>, _addr: inkwell::values::ArrayValue<'b>) {

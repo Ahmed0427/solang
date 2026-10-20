@@ -3343,7 +3343,7 @@ pub fn emit_function_call(
                 },
             );
 
-            let success = if ns.target.is_polkadot() {
+            let success = if ns.target.is_polkadot() || ns.target == Target::Riscv {
                 let ret_code = Expression::Variable {
                     loc: *loc,
                     ty: Type::Uint(32),
@@ -3450,9 +3450,7 @@ pub fn emit_function_call(
                     expression(expr, cfg, caller_contract_no, func, ns, vartab, opt, target)
                 });
 
-                let success = ns
-                    .target
-                    .is_polkadot()
+                let success = (ns.target.is_polkadot() || ns.target == Target::Riscv)
                     .then(|| vartab.temp_name("success", &Type::Uint(32)));
                 cfg.add(
                     vartab,
@@ -3471,7 +3469,7 @@ pub fn emit_function_call(
                     },
                 );
 
-                if ns.target.is_polkadot() {
+                if ns.target.is_polkadot() || ns.target == Target::Riscv {
                     polkadot::RetCodeCheckBuilder::default()
                         .loc(*loc)
                         .msg("external call failed")
@@ -3554,9 +3552,7 @@ pub fn emit_function_call(
                 let flags = call_args.flags.as_ref().map(|expr| {
                     expression(expr, cfg, caller_contract_no, func, ns, vartab, opt, target)
                 });
-                let success = ns
-                    .target
-                    .is_polkadot()
+                let success = (ns.target.is_polkadot() || ns.target == Target::Riscv)
                     .then(|| vartab.temp_name("success", &Type::Uint(32)));
                 cfg.add(
                     vartab,
@@ -3575,7 +3571,7 @@ pub fn emit_function_call(
                     },
                 );
 
-                if ns.target.is_polkadot() {
+                if ns.target.is_polkadot() || ns.target == Target::Riscv {
                     polkadot::RetCodeCheckBuilder::default()
                         .loc(*loc)
                         .msg("external call failed")

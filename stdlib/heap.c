@@ -46,8 +46,16 @@ void __init_heap()
 #elif defined(__riscv)
 #define HEAP_START ((struct chunk *)riscv_heap)
 
+// Every entry point calls this, also when a contract is entered again while it
+// is still running (A calls B calls A): only the first call may set it up.
+static bool riscv_heap_ready;
+
 void __init_heap()
 {
+    if (riscv_heap_ready)
+        return;
+    riscv_heap_ready = true;
+
     struct chunk *first = HEAP_START;
     first->next = first->prev = NULL;
     first->allocated = false;

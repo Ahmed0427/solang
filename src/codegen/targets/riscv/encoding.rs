@@ -94,12 +94,18 @@ impl EthAbiEncoding {
         let ty = expr.ty().unwrap_user_type(ns);
 
         let widened = match &ty {
-            // The cast converts the big-endian byte array to a number.
+            // The cast converts the big-endian byte array to a number. A
+            // contract is cast to an address first: emit only converts those.
             Type::Address(_) | Type::Contract(_) => {
                 return Expression::Cast {
                     loc: Codegen,
                     ty: Uint(256),
-                    expr: expr.clone().into(),
+                    expr: Expression::Cast {
+                        loc: Codegen,
+                        ty: Type::Address(false),
+                        expr: expr.clone().into(),
+                    }
+                    .into(),
                 }
             }
             Type::Int(256) | Type::Uint(256) | Type::Bytes(32) | Type::Value => expr.clone(),
@@ -243,13 +249,21 @@ impl EthAbiEncoding {
                 }
                 .into(),
             },
-            Type::Address(_) | Type::Contract(_) | Type::Bytes(_) | Type::Value => {
-                Expression::Cast {
+            Type::Contract(_) => Expression::Cast {
+                loc: Codegen,
+                ty: ty.clone(),
+                expr: Expression::Cast {
                     loc: Codegen,
-                    ty: ty.clone(),
+                    ty: Type::Address(false),
                     expr: word.clone().into(),
                 }
-            }
+                .into(),
+            },
+            Type::Address(_) | Type::Bytes(_) | Type::Value => Expression::Cast {
+                loc: Codegen,
+                ty: ty.clone(),
+                expr: word.clone().into(),
+            },
             _ => Expression::Trunc {
                 loc: Codegen,
                 ty: ty.clone(),
