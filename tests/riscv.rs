@@ -61,6 +61,11 @@ fn c_str(elf: &[u8], at: usize) -> String {
 
 /// The global symbols of an ELF64 object: (defined, undefined).
 fn global_symbols(elf: &[u8]) -> (BTreeSet<String>, BTreeSet<String>) {
+    symbols(elf, 1)
+}
+
+/// The symbols with this ELF binding (1 global, 2 weak): (defined, undefined).
+fn symbols(elf: &[u8], binding: u8) -> (BTreeSet<String>, BTreeSet<String>) {
     let section = |i: usize| u64_at(elf, 0x28) + i * u16_at(elf, 0x3a);
     let symtab = (0..u16_at(elf, 0x3c))
         .map(section)
@@ -71,7 +76,7 @@ fn global_symbols(elf: &[u8]) -> (BTreeSet<String>, BTreeSet<String>) {
     let (mut defined, mut undefined) = (BTreeSet::new(), BTreeSet::new());
     let start = u64_at(elf, symtab + 0x18);
     for sym in (start..start + u64_at(elf, symtab + 0x20)).step_by(24) {
-        if elf[sym + 4] >> 4 != 1 {
+        if elf[sym + 4] >> 4 != binding {
             continue;
         }
         let name = c_str(elf, strtab + u32_at(elf, sym));
@@ -112,16 +117,7 @@ fn object_exports_entry_points_and_imports_syscalls() {
     let (defined, undefined) = global_symbols(&compile_incrementer());
 
     let set = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<BTreeSet<_>>();
-    assert_eq!(
-        defined,
-        set(&[
-            "__ashlti3",
-            "__ashrti3",
-            "__lshrti3",
-            "solang_call",
-            "solang_deploy"
-        ])
-    );
+    assert_eq!(defined, set(&["solang_call", "solang_deploy"]));
     assert_eq!(
         undefined,
         set(&[
@@ -162,4 +158,19 @@ fn events_import_log() {
     let (_, undefined) = global_symbols(&compile_testcase("token_events.sol"));
     assert!(undefined.contains("__sys_log"), "{undefined:?}");
     assert!(undefined.contains("__sys_caller"), "{undefined:?}");
+}
+
+/// The 128-bit shift helpers LLVM calls by name are weak, so two contracts
+/// can be linked into one program.
+#[test]
+fn helpers_are_weak() {
+    if !have_llc() {
+        return;
+    }
+    let (weak, _) = symbols(&compile_testcase("balances.sol"), 2);
+    let set = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<BTreeSet<_>>();
+    assert!(
+        weak.is_subset(&set(&["__ashlti3", "__ashrti3", "__lshrti3"])),
+        "{weak:?}"
+    );
 }
