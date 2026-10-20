@@ -26,6 +26,102 @@ fn emit_or_panic<T>(result: Result<T, BuilderError>, operation: impl Into<String
     result.unwrap_or_else(|err| panic!("{}", CodegenError::llvm_builder(operation, err)))
 }
 
+/// RISC-V `div` and `rem` don't trap on a zero divisor, so the narrow
+/// divisions that the helpers above 64 bits don't cover check it here.
+fn riscv_divisor_check<'a, T: TargetRuntime<'a> + ?Sized>(
+    target: &T,
+    bin: &Binary<'a>,
+    divisor: IntValue<'a>,
+    function: FunctionValue<'a>,
+    loc: &solang_parser::pt::Loc,
+) {
+    if bin.ns.target != Target::Riscv {
+        return;
+    }
+    let is_zero = emit_or_panic(
+        bin.builder.build_int_compare(
+            IntPredicate::EQ,
+            divisor,
+            divisor.get_type().const_zero(),
+            "divisor_is_zero",
+        ),
+        "emitting division-by-zero check",
+    );
+    let bail_block = bin.context.append_basic_block(function, "division_by_zero");
+    let ok_block = bin.context.append_basic_block(function, "divisor_ok");
+    emit_or_panic(
+        bin.builder
+            .build_conditional_branch(is_zero, bail_block, ok_block),
+        "emitting division-by-zero check",
+    );
+
+    bin.builder.position_at_end(bail_block);
+    bin.log_runtime_error(target, "division by zero".to_string(), Some(*loc));
+    let (revert_out, revert_out_len) = bin.panic_data_const(PanicCode::DivisionByZero);
+    target.assert_failure(bin, revert_out, revert_out_len);
+
+    bin.builder.position_at_end(ok_block);
+}
+
+/// `type(intN).min / -1` overflows; solc reverts with `Panic(0x11)`. RISC-V
+/// and the wide division helpers return `min`. The codegen doesn't know if
+/// the division is in an `unchecked` block, so this always checks.
+fn riscv_signed_division_check<'a, T: TargetRuntime<'a> + ?Sized>(
+    target: &T,
+    bin: &Binary<'a>,
+    dividend: IntValue<'a>,
+    divisor: IntValue<'a>,
+    function: FunctionValue<'a>,
+    loc: &solang_parser::pt::Loc,
+) {
+    if bin.ns.target != Target::Riscv {
+        return;
+    }
+    let ty = dividend.get_type();
+    let min = emit_or_panic(
+        bin.builder.build_left_shift(
+            ty.const_int(1, false),
+            ty.const_int(ty.get_bit_width() as u64 - 1, false),
+            "min",
+        ),
+        "emitting signed division overflow check",
+    );
+    let is_min = emit_or_panic(
+        bin.builder
+            .build_int_compare(IntPredicate::EQ, dividend, min, "dividend_is_min"),
+        "emitting signed division overflow check",
+    );
+    let is_minus_one = emit_or_panic(
+        bin.builder.build_int_compare(
+            IntPredicate::EQ,
+            divisor,
+            ty.const_all_ones(),
+            "divisor_is_minus_one",
+        ),
+        "emitting signed division overflow check",
+    );
+    let overflows = emit_or_panic(
+        bin.builder.build_and(is_min, is_minus_one, "overflows"),
+        "emitting signed division overflow check",
+    );
+    let bail_block = bin
+        .context
+        .append_basic_block(function, "division_overflow");
+    let ok_block = bin.context.append_basic_block(function, "division_ok");
+    emit_or_panic(
+        bin.builder
+            .build_conditional_branch(overflows, bail_block, ok_block),
+        "emitting signed division overflow check",
+    );
+
+    bin.builder.position_at_end(bail_block);
+    bin.log_runtime_error(target, "math overflow".to_string(), Some(*loc));
+    let (revert_out, revert_out_len) = bin.panic_data_const(PanicCode::MathOverflow);
+    target.assert_failure(bin, revert_out, revert_out_len);
+
+    bin.builder.position_at_end(ok_block);
+}
+
 fn runtime_helper<'a>(
     bin: &Binary<'a>,
     name: &str,
@@ -332,6 +428,10 @@ pub(super) fn expression<'a, T: TargetRuntime<'a> + ?Sized>(
 
             let bits = left.get_type().get_bit_width();
 
+            if bits <= 64 {
+                riscv_divisor_check(target, bin, right, function, loc);
+            }
+
             if bits > 64 {
                 let div_bits = if bits <= 128 { 128 } else { 256 };
 
@@ -463,6 +563,11 @@ pub(super) fn expression<'a, T: TargetRuntime<'a> + ?Sized>(
             let right = expression(target, bin, right, vartab, function).into_int_value();
 
             let bits = left.get_type().get_bit_width();
+
+            if bits <= 64 {
+                riscv_divisor_check(target, bin, right, function, loc);
+            }
+            riscv_signed_division_check(target, bin, left, right, function, loc);
 
             if bits > 64 {
                 let div_bits = if bits <= 128 { 128 } else { 256 };
@@ -684,6 +789,10 @@ pub(super) fn expression<'a, T: TargetRuntime<'a> + ?Sized>(
 
             let bits = left.get_type().get_bit_width();
 
+            if bits <= 64 {
+                riscv_divisor_check(target, bin, right, function, loc);
+            }
+
             if bits > 64 {
                 let div_bits = if bits <= 128 { 128 } else { 256 };
 
@@ -815,6 +924,10 @@ pub(super) fn expression<'a, T: TargetRuntime<'a> + ?Sized>(
             let right = expression(target, bin, right, vartab, function).into_int_value();
 
             let bits = left.get_type().get_bit_width();
+
+            if bits <= 64 {
+                riscv_divisor_check(target, bin, right, function, loc);
+            }
 
             if bits > 64 {
                 let div_bits = if bits <= 128 { 128 } else { 256 };
