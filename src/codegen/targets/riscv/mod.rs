@@ -29,6 +29,18 @@ impl TargetCodegen for RiscvTarget {
 
     fn post_process_program(&self, _ns: &mut Namespace, _opt: &Options) {}
 
+    fn abi_encode_with_selector(
+        &self,
+        loc: &Loc,
+        selector: Expression,
+        args: Vec<Expression>,
+        ns: &Namespace,
+        vartab: &mut Vartable,
+        cfg: &mut ControlFlowGraph,
+    ) -> (Expression, Expression) {
+        encoding::abi_encode(loc, Some(selector), args, ns, vartab, cfg)
+    }
+
     fn lower_storage_array_length(
         &self,
         loc: &Loc,
