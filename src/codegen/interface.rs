@@ -147,6 +147,20 @@ pub(crate) trait TargetCodegen {
         crate::codegen::encoding::abi_encode(loc, args, ns, vartab, cfg, packed)
     }
 
+    /// `selector` (4 bytes) followed by the encoded `args`.
+    fn abi_encode_with_selector(
+        &self,
+        loc: &Loc,
+        selector: Expression,
+        mut args: Vec<Expression>,
+        ns: &Namespace,
+        vartab: &mut Vartable,
+        cfg: &mut ControlFlowGraph,
+    ) -> (Expression, Expression) {
+        args.insert(0, selector);
+        self.abi_encode(loc, args, ns, vartab, cfg, false)
+    }
+
     fn abi_decode(
         &self,
         loc: &Loc,

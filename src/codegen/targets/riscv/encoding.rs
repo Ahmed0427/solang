@@ -654,3 +654,332 @@ impl AbiEncoding for EthAbiEncoding {
         Some(result)
     }
 }
+
+/// `string` and `bytes`: the dynamic types this target encodes and decodes.
+fn is_dynamic_bytes(ty: &Type) -> bool {
+    matches!(ty.deref_any(), Type::String | Type::DynamicBytes)
+}
+
+fn word(expr: Expression) -> Expression {
+    Expression::Cast {
+        loc: Codegen,
+        ty: Type::Bytes(32),
+        expr: Expression::ZeroExt {
+            loc: Codegen,
+            ty: Uint(256),
+            expr: expr.into(),
+        }
+        .into(),
+    }
+}
+
+fn set_u32(res: usize, expr: Expression, vartab: &mut Vartable, cfg: &mut ControlFlowGraph) {
+    cfg.add(
+        vartab,
+        Instr::Set {
+            loc: Codegen,
+            res,
+            expr,
+        },
+    );
+}
+
+fn variable(var_no: usize, ty: Type) -> Expression {
+    Expression::Variable {
+        loc: Codegen,
+        ty,
+        var_no,
+    }
+}
+
+/// `len` rounded up to a multiple of 32.
+fn padded(len: Expression) -> Expression {
+    Expression::BitwiseAnd {
+        loc: Codegen,
+        ty: Uint(32),
+        left: len.add_u32(number(31.into())).into(),
+        right: number((!31u32).into()).into(),
+    }
+}
+
+/// Ethereum ABI encoding of a tuple, with `selector` (4 bytes) in front if
+/// given. Static values go in the head; `string` and `bytes` put an offset
+/// in the head and their length and padded bytes in the tail.
+pub(crate) fn abi_encode(
+    loc: &solang_parser::pt::Loc,
+    selector: Option<Expression>,
+    args: Vec<Expression>,
+    ns: &Namespace,
+    vartab: &mut Vartable,
+    cfg: &mut ControlFlowGraph,
+) -> (Expression, Expression) {
+    let mut encoder = EthAbiEncoding::new();
+    let prefix = if selector.is_some() { 4 } else { 0 };
+
+    // The head, then the length of each dynamic value.
+    let mut head = BigInt::from(0);
+    let mut lengths = Vec::with_capacity(args.len());
+    for arg in &args {
+        if is_dynamic_bytes(&arg.ty()) {
+            head += WORD;
+            let len = vartab.temp_anonymous(&Uint(32));
+            set_u32(
+                len,
+                Expression::Builtin {
+                    loc: *loc,
+                    tys: vec![Uint(32)],
+                    kind: Builtin::ArrayLength,
+                    args: vec![arg.clone()],
+                },
+                vartab,
+                cfg,
+            );
+            lengths.push(Some(variable(len, Uint(32))));
+        } else {
+            head += static_size(&arg.ty(), ns);
+            lengths.push(None);
+        }
+    }
+
+    let mut size = number(head.clone() + prefix);
+    for len in lengths.iter().flatten() {
+        size = size.add_u32(number(WORD.into()).add_u32(padded(len.clone())));
+    }
+    let size_var = vartab.temp_anonymous(&Uint(32));
+    set_u32(size_var, size, vartab, cfg);
+    let size = variable(size_var, Uint(32));
+
+    // Zero-filled, so padding needs no writes.
+    let buffer_var = vartab.temp_name("abi_encoded", &Type::DynamicBytes);
+    set_u32(
+        buffer_var,
+        Expression::AllocDynamicBytes {
+            loc: *loc,
+            ty: Type::DynamicBytes,
+            size: size.clone().into(),
+            initializer: None,
+        },
+        vartab,
+        cfg,
+    );
+    let buffer = variable(buffer_var, Type::DynamicBytes);
+
+    if let Some(selector) = selector {
+        cfg.add(
+            vartab,
+            Instr::WriteBuffer {
+                buf: buffer.clone(),
+                offset: number(0.into()),
+                value: Expression::Cast {
+                    loc: Codegen,
+                    ty: Type::Bytes(4),
+                    expr: selector.into(),
+                },
+            },
+        );
+    }
+
+    // Offsets in the head count from the start of the tuple, after the selector.
+    let tail_var = vartab.temp_anonymous(&Uint(32));
+    set_u32(tail_var, number(head), vartab, cfg);
+    let tail = variable(tail_var, Uint(32));
+    let at = |offset: Expression| offset.add_u32(number(prefix.into()));
+
+    let mut offset = number(0.into());
+    for (arg_no, (arg, len)) in args.iter().zip(lengths).enumerate() {
+        let Some(len) = len else {
+            let advance =
+                encoder.encode(arg, &buffer, &at(offset.clone()), arg_no, ns, vartab, cfg);
+            offset = offset.add_u32(advance);
+            continue;
+        };
+        let write = |offset: Expression,
+                     value: Expression,
+                     vartab: &mut Vartable,
+                     cfg: &mut ControlFlowGraph| {
+            cfg.add(
+                vartab,
+                Instr::WriteBuffer {
+                    buf: buffer.clone(),
+                    offset: at(offset),
+                    value: word(value),
+                },
+            )
+        };
+        write(offset.clone(), tail.clone(), vartab, cfg);
+        write(tail.clone(), len.clone(), vartab, cfg);
+        cfg.add(
+            vartab,
+            Instr::MemCopy {
+                source: arg.clone(),
+                destination: Expression::AdvancePointer {
+                    pointer: buffer.clone().into(),
+                    bytes_offset: at(tail.clone().add_u32(number(WORD.into()))).into(),
+                },
+                bytes: len.clone(),
+            },
+        );
+        set_u32(
+            tail_var,
+            tail.clone()
+                .add_u32(number(WORD.into()))
+                .add_u32(padded(len)),
+            vartab,
+            cfg,
+        );
+        offset = offset.add_u32(number(WORD.into()));
+    }
+
+    (buffer, size)
+}
+
+/// Ethereum ABI decoding of a tuple, checked as solc checks it: calldata
+/// shorter than the head, an offset or length pointing outside the buffer, or
+/// a non-canonical value revert with empty data; trailing bytes are ignored.
+pub(crate) fn abi_decode(
+    buffer: &Expression,
+    types: &[Type],
+    ns: &Namespace,
+    vartab: &mut Vartable,
+    cfg: &mut ControlFlowGraph,
+    buffer_size: Expression,
+) -> Vec<Expression> {
+    let encoder = EthAbiEncoding::new();
+    let size_var = vartab.temp_anonymous(&Uint(32));
+    set_u32(size_var, buffer_size, vartab, cfg);
+    let size = variable(size_var, Uint(32));
+    let size256 = Expression::ZeroExt {
+        loc: Codegen,
+        ty: Uint(256),
+        expr: size.clone().into(),
+    };
+
+    let head_types: Vec<Type> = types
+        .iter()
+        .map(|ty| {
+            if is_dynamic_bytes(ty) {
+                Uint(256)
+            } else {
+                ty.clone()
+            }
+        })
+        .collect();
+    let head: BigInt = head_types.iter().map(|ty| static_size(ty, ns)).sum();
+    EthAbiEncoding::require(
+        Expression::LessEqual {
+            loc: Codegen,
+            signed: false,
+            left: number(head).into(),
+            right: size.clone().into(),
+        },
+        ns,
+        vartab,
+        cfg,
+    );
+
+    // The head is in bounds, so reading it needs no more checks.
+    let mut validator = BufferValidator::new(size_var, &head_types);
+    validator.assume_verified();
+
+    let mut offset = number(0.into());
+    let mut values = Vec::with_capacity(types.len());
+    for (ty, head_ty) in types.iter().zip(&head_types) {
+        let (value, advance) =
+            encoder.read_from_buffer(buffer, &offset, head_ty, &mut validator, ns, vartab, cfg);
+        offset = offset.add_u32(advance);
+        if !is_dynamic_bytes(ty) {
+            values.push(value);
+            continue;
+        }
+
+        // value is the offset of the length word: offset + 32 <= size.
+        let room = Expression::Subtract {
+            loc: Codegen,
+            ty: Uint(256),
+            overflowing: true,
+            left: size256.clone().into(),
+            right: Expression::NumberLiteral {
+                loc: Codegen,
+                ty: Uint(256),
+                value: WORD.into(),
+            }
+            .into(),
+        };
+        EthAbiEncoding::require(
+            Expression::LessEqual {
+                loc: Codegen,
+                signed: false,
+                left: value.clone().into(),
+                right: room.clone().into(),
+            },
+            ns,
+            vartab,
+            cfg,
+        );
+        let start = Expression::Trunc {
+            loc: Codegen,
+            ty: Uint(32),
+            expr: value.clone().into(),
+        };
+        let (len, _) =
+            encoder.read_from_buffer(buffer, &start, &Uint(256), &mut validator, ns, vartab, cfg);
+        // len <= size - 32 - offset
+        EthAbiEncoding::require(
+            Expression::LessEqual {
+                loc: Codegen,
+                signed: false,
+                left: len.clone().into(),
+                right: Expression::Subtract {
+                    loc: Codegen,
+                    ty: Uint(256),
+                    overflowing: true,
+                    left: room.into(),
+                    right: value.into(),
+                }
+                .into(),
+            },
+            ns,
+            vartab,
+            cfg,
+        );
+
+        let len_var = vartab.temp_anonymous(&Uint(32));
+        set_u32(
+            len_var,
+            Expression::Trunc {
+                loc: Codegen,
+                ty: Uint(32),
+                expr: len.into(),
+            },
+            vartab,
+            cfg,
+        );
+        let len = variable(len_var, Uint(32));
+        let ty = ty.deref_any().clone();
+        let bytes_var = vartab.temp_anonymous(&ty);
+        set_u32(
+            bytes_var,
+            Expression::AllocDynamicBytes {
+                loc: Codegen,
+                ty: ty.clone(),
+                size: len.clone().into(),
+                initializer: None,
+            },
+            vartab,
+            cfg,
+        );
+        cfg.add(
+            vartab,
+            Instr::MemCopy {
+                source: Expression::AdvancePointer {
+                    pointer: buffer.clone().into(),
+                    bytes_offset: start.add_u32(number(WORD.into())).into(),
+                },
+                destination: variable(bytes_var, ty.clone()),
+                bytes: len,
+            },
+        );
+        values.push(variable(bytes_var, ty));
+    }
+    values
+}

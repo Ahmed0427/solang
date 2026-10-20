@@ -84,6 +84,11 @@ impl BufferValidator<'_> {
         self.build_out_of_bounds_fail_branch(offset, ns, vartab, cfg);
     }
 
+    /// Skip all checks: the caller has checked the whole buffer.
+    pub(crate) fn assume_verified(&mut self) {
+        self.verified_until = Some(self.types.len());
+    }
+
     /// Checks if a buffer validation is necessary
     pub(crate) fn validation_necessary(&self) -> bool {
         self.verified_until.is_none() || self.current_arg > self.verified_until.unwrap()

@@ -2076,17 +2076,14 @@ fn abi_encode_packed(
 fn encode_many_with_selector(
     loc: &pt::Loc,
     selector: Expression,
-    mut args: Vec<Expression>,
+    args: Vec<Expression>,
     ns: &Namespace,
     vartab: &mut Vartable,
     cfg: &mut ControlFlowGraph,
     target: &dyn TargetCodegen,
 ) -> Expression {
-    let mut encoder_args: Vec<Expression> = Vec::with_capacity(args.len() + 1);
-    encoder_args.push(selector);
-    encoder_args.append(&mut args);
     target
-        .abi_encode(loc, encoder_args, ns, vartab, cfg, false)
+        .abi_encode_with_selector(loc, selector, args, ns, vartab, cfg)
         .0
 }
 
@@ -3391,7 +3388,7 @@ pub fn emit_function_call(
                     .map(|contract_no| (contract_no, *function_no));
 
                 let mut tys: Vec<Type> = args.iter().map(|a| a.ty()).collect();
-                let mut args: Vec<Expression> = args
+                let args: Vec<Expression> = args
                     .iter()
                     .map(|a| expression(a, cfg, caller_contract_no, func, ns, vartab, opt, target))
                     .collect();
@@ -3440,16 +3437,14 @@ pub fn emit_function_call(
 
                 tys.insert(0, Type::Bytes(selector.len() as u8));
 
-                args.insert(
-                    0,
-                    Expression::BytesLiteral {
-                        loc: *loc,
-                        ty: Type::Bytes(selector.len() as u8),
-                        value: selector,
-                    },
-                );
+                let selector = Expression::BytesLiteral {
+                    loc: *loc,
+                    ty: Type::Bytes(selector.len() as u8),
+                    value: selector,
+                };
 
-                let (payload, _) = target.abi_encode(loc, args, ns, vartab, cfg, false);
+                let (payload, _) =
+                    target.abi_encode_with_selector(loc, selector, args, ns, vartab, cfg);
 
                 let flags = call_args.flags.as_ref().map(|expr| {
                     expression(expr, cfg, caller_contract_no, func, ns, vartab, opt, target)
@@ -3510,7 +3505,7 @@ pub fn emit_function_call(
             } = function.ty()
             {
                 let mut tys: Vec<Type> = args.iter().map(|a| a.ty()).collect();
-                let mut args = args
+                let args = args
                     .iter()
                     .map(|a| expression(a, cfg, caller_contract_no, func, ns, vartab, opt, target))
                     .collect::<Vec<Expression>>();
@@ -3552,9 +3547,9 @@ pub fn emit_function_call(
                 let address = function.external_function_address();
 
                 tys.insert(0, Type::Bytes(ns.target.selector_length()));
-                args.insert(0, selector);
 
-                let (payload, _) = target.abi_encode(loc, args, ns, vartab, cfg, false);
+                let (payload, _) =
+                    target.abi_encode_with_selector(loc, selector, args, ns, vartab, cfg);
 
                 let flags = call_args.flags.as_ref().map(|expr| {
                     expression(expr, cfg, caller_contract_no, func, ns, vartab, opt, target)

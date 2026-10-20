@@ -39,6 +39,14 @@ pub(crate) fn abi_encode(
     cfg: &mut ControlFlowGraph,
     packed: bool,
 ) -> (Expression, Expression) {
+    if ns.target == Target::Riscv {
+        if packed {
+            unimplemented!("the riscv target cannot abi.encodePacked yet");
+        }
+        return crate::codegen::targets::riscv::encoding::abi_encode(
+            loc, None, args, ns, vartab, cfg,
+        );
+    }
     let mut encoder = create_encoder(ns, packed);
     let target = make_target(ns);
     let size = calculate_size_args(&mut encoder, &args, ns, vartab, cfg, target.as_ref());
@@ -81,6 +89,31 @@ pub(crate) fn abi_encode(
     (buffer, size)
 }
 
+/// Encode a 4-byte `selector` followed by `args`: calldata for a call, or
+/// revert data for an error. Encodings without a separate selector just
+/// encode it as the first argument.
+pub(crate) fn abi_encode_with_selector(
+    loc: &Loc,
+    selector: Expression,
+    mut args: Vec<Expression>,
+    ns: &Namespace,
+    vartab: &mut Vartable,
+    cfg: &mut ControlFlowGraph,
+) -> (Expression, Expression) {
+    if ns.target == Target::Riscv {
+        return crate::codegen::targets::riscv::encoding::abi_encode(
+            loc,
+            Some(selector),
+            args,
+            ns,
+            vartab,
+            cfg,
+        );
+    }
+    args.insert(0, selector);
+    abi_encode(loc, args, ns, vartab, cfg, false)
+}
+
 /// Insert decoding routines into the `cfg` for the `Expression`s in `args`.
 /// Returns a vector containing the encoded data.
 pub(crate) fn abi_decode(
@@ -92,6 +125,17 @@ pub(crate) fn abi_decode(
     cfg: &mut ControlFlowGraph,
     buffer_size_expr: Option<Expression>,
 ) -> Vec<Expression> {
+    if ns.target == Target::Riscv {
+        let size = buffer_size_expr.unwrap_or_else(|| Expression::Builtin {
+            loc: Codegen,
+            tys: vec![Uint(32)],
+            kind: Builtin::ArrayLength,
+            args: vec![buffer.clone()],
+        });
+        return crate::codegen::targets::riscv::encoding::abi_decode(
+            buffer, types, ns, vartab, cfg, size,
+        );
+    }
     let buffer_size = vartab.temp_anonymous(&Uint(32));
     if let Some(length_expression) = buffer_size_expr {
         cfg.add(

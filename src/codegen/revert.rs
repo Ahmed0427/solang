@@ -3,7 +3,7 @@
 //! Releated to code that ultimately compiles to the target
 //! equivalent instruction of EVM revert (0xfd).
 
-use super::encoding::{abi_encode, create_encoder};
+use super::encoding::{abi_encode_with_selector, create_encoder};
 use super::expression::expression;
 use super::Options;
 use super::{
@@ -106,7 +106,13 @@ impl SolidityError {
                             initializer: bytes.into(),
                         }
                     })
-                    .or_else(|| abi_encode(loc, args, ns, vartab, cfg, false).0.into())
+                    .or_else(|| {
+                        let args = args[1..].to_vec();
+                        let selector = self.selector_expression(ns);
+                        abi_encode_with_selector(loc, selector, args, ns, vartab, cfg)
+                            .0
+                            .into()
+                    })
             }
             Self::Custom { exprs, .. } => {
                 let mut args = exprs.to_owned();
@@ -126,7 +132,13 @@ impl SolidityError {
                             initializer: bytes.into(),
                         }
                     })
-                    .or_else(|| abi_encode(loc, args, ns, vartab, cfg, false).0.into())
+                    .or_else(|| {
+                        let args = args[1..].to_vec();
+                        let selector = self.selector_expression(ns);
+                        abi_encode_with_selector(loc, selector, args, ns, vartab, cfg)
+                            .0
+                            .into()
+                    })
             }
             Self::Panic(code) => {
                 let code = Expression::NumberLiteral {
