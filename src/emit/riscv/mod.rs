@@ -59,20 +59,20 @@ impl RiscvTarget {
     /// Hide everything but the entry points from the guest it is linked into.
     /// (`Binary::internalize` hides nothing once there are two exports.)
     fn internalize(bin: &Binary) {
-        // LLVM emits calls to these by name, so they must stay visible.
-        const EXPORTS: [&str; 5] = [
-            "solang_deploy",
-            "solang_call",
-            "__ashlti3",
-            "__lshrti3",
-            "__ashrti3",
-        ];
+        const EXPORTS: [&str; 2] = ["solang_deploy", "solang_call"];
+        // LLVM emits calls to these by name, so they must stay visible. Weak,
+        // so that several contracts can be linked into one program.
+        const HELPERS: [&str; 3] = ["__ashlti3", "__lshrti3", "__ashrti3"];
 
         let mut func = bin.module.get_first_function();
         while let Some(f) = func {
             let name = f.get_name().to_str().unwrap();
-            if f.count_basic_blocks() > 0 && !EXPORTS.contains(&name) {
-                f.set_linkage(Linkage::Internal);
+            if f.count_basic_blocks() > 0 {
+                if HELPERS.contains(&name) {
+                    f.set_linkage(Linkage::WeakODR);
+                } else if !EXPORTS.contains(&name) {
+                    f.set_linkage(Linkage::Internal);
+                }
             }
             func = f.get_next_function();
         }
