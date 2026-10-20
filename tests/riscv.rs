@@ -153,3 +153,13 @@ fn mapping_contract_imports_keccak() {
         "{undefined:?}"
     );
 }
+
+#[test]
+fn events_import_log() {
+    if !have_llc() {
+        return;
+    }
+    let (_, undefined) = global_symbols(&compile_testcase("token_events.sol"));
+    assert!(undefined.contains("__sys_log"), "{undefined:?}");
+    assert!(undefined.contains("__sys_caller"), "{undefined:?}");
+}

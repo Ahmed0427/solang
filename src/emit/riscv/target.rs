@@ -538,6 +538,19 @@ pub(crate) fn declare_syscalls(bin: &mut Binary) {
     let revert = bin.module.add_function("__sys_revert", revert_ty, None);
     revert.set_linkage(Linkage::External);
 
+    let log_ty = void_ty.fn_type(
+        &[
+            i8_ptr_ty.into(),
+            i64_ty.into(),
+            i8_ptr_ty.into(),
+            i64_ty.into(),
+        ],
+        false,
+    );
+    bin.module
+        .add_function("__sys_log", log_ty, None)
+        .set_linkage(Linkage::External);
+
     let keccak_ty = void_ty.fn_type(&[i8_ptr_ty.into(), i64_ty.into(), i8_ptr_ty.into()], false);
     let keccak = bin.module.add_function("__sys_keccak256", keccak_ty, None);
     keccak.set_linkage(Linkage::External);
@@ -902,14 +915,62 @@ impl<'a> TargetRuntime<'a> for RiscvTargetRuntime {
         }
     }
 
+    /// The topics, 32 bytes each, are copied next to each other for `__sys_log`.
     fn emit_event<'b>(
         &self,
-        _bin: &Binary<'b>,
-        _function: FunctionValue<'b>,
-        _data: BasicValueEnum<'b>,
-        _topics: &[BasicValueEnum<'b>],
+        bin: &Binary<'b>,
+        function: FunctionValue<'b>,
+        data: BasicValueEnum<'b>,
+        topics: &[BasicValueEnum<'b>],
     ) {
-        unimplemented!("emit_event")
+        let i32_ty = bin.context.i32_type();
+        let i64_ty = bin.context.i64_type();
+        let buf = bin.build_alloca(
+            function,
+            bin.context
+                .i8_type()
+                .array_type(32 * topics.len().max(1) as u32),
+            "topics",
+        );
+        for (i, topic) in topics.iter().enumerate() {
+            let dest = unsafe {
+                bin.builder
+                    .build_gep(
+                        bin.context.i8_type(),
+                        buf,
+                        &[i32_ty.const_int(32 * i as u64, false)],
+                        "topic",
+                    )
+                    .unwrap()
+            };
+            bin.builder
+                .build_call(
+                    bin.module.get_function("__memcpy").unwrap(),
+                    &[
+                        dest.into(),
+                        bin.vector_bytes(*topic).into(),
+                        i32_ty.const_int(32, false).into(),
+                    ],
+                    "",
+                )
+                .unwrap();
+        }
+        let data_len = bin
+            .builder
+            .build_int_z_extend(bin.vector_len(data), i64_ty, "data_len")
+            .unwrap();
+        bin.builder
+            .build_call(
+                bin.module.get_function("__sys_log").unwrap(),
+                &[
+                    bin.vector_bytes(data).into(),
+                    data_len.into(),
+                    buf.into(),
+                    i64_ty.const_int(topics.len() as u64, false).into(),
+                ],
+                "",
+            )
+            .unwrap();
     }
 
     fn external_call<'b>(
