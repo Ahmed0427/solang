@@ -1372,7 +1372,9 @@ fn try_type_method(
             let ty = match func.name.as_str() {
                 "call" => Some(CallTy::Regular),
                 "delegatecall" if ns.target != Target::Solana => Some(CallTy::Delegate),
-                "staticcall" if ns.target == Target::EVM => Some(CallTy::Static),
+                "staticcall" if matches!(ns.target, Target::EVM | Target::Riscv) => {
+                    Some(CallTy::Static)
+                }
                 _ => None,
             };
 

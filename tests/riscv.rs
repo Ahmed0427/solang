@@ -24,6 +24,11 @@ fn compile_incrementer() -> Vec<u8> {
 }
 
 fn compile_testcase(file: &str) -> Vec<u8> {
+    compile_contract(file, 0)
+}
+
+/// The object of the `n`th contract in the file.
+fn compile_contract(file: &str, n: usize) -> Vec<u8> {
     let mut resolver = FileResolver::default();
     resolver.add_import_path(std::path::Path::new("tests/contract_testcases/riscv"));
     let opt = Options {
@@ -39,7 +44,7 @@ fn compile_testcase(file: &str) -> Vec<u8> {
         "0.0.1",
     );
     assert!(!ns.diagnostics.any_errors());
-    outputs.into_iter().next().unwrap().0
+    outputs.into_iter().nth(n).unwrap().0
 }
 
 fn u16_at(elf: &[u8], at: usize) -> usize {
@@ -172,5 +177,26 @@ fn helpers_are_weak() {
     assert!(
         weak.is_subset(&set(&["__ashlti3", "__ashrti3", "__lshrti3"])),
         "{weak:?}"
+    );
+}
+
+#[test]
+fn calls_import_call_syscalls() {
+    if !have_llc() {
+        return;
+    }
+    let (_, undefined) = global_symbols(&compile_contract("calls.sol", 1));
+    for name in [
+        "__sys_call",
+        "__sys_staticcall",
+        "__sys_delegatecall",
+        "__sys_returndata_size",
+        "__sys_returndata_copy",
+    ] {
+        assert!(undefined.contains(name), "{name} in {undefined:?}");
+    }
+    assert!(
+        undefined.iter().all(|name| name.starts_with("__sys_")),
+        "{undefined:?}"
     );
 }

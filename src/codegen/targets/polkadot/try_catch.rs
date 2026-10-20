@@ -4,7 +4,7 @@ use crate::codegen::targets::polkadot::return_code as polkadot;
 use crate::codegen::{
     cfg::{ControlFlowGraph, Instr},
     constructor::call_constructor,
-    encoding::{abi_decode, abi_encode},
+    encoding::abi_decode,
     expression::{default_gas, expression},
     interface::TargetCodegen,
     revert::{ERROR_SELECTOR, PANIC_SELECTOR},
@@ -16,6 +16,7 @@ use crate::sema::ast::{
     self, CallTy, ExternalCallAccounts, Function, Namespace, RetrieveType, TryCatch, Type,
     Type::Uint,
 };
+use crate::Target;
 use num_bigint::{BigInt, Sign};
 use num_traits::Zero;
 use solang_parser::pt::{self, CodeLocation, Loc::Codegen};
@@ -34,7 +35,7 @@ pub(crate) fn try_catch(
     opt: &Options,
     target: &dyn TargetCodegen,
 ) {
-    if !ns.target.is_polkadot() {
+    if !ns.target.is_polkadot() && ns.target != Target::Riscv {
         unimplemented!()
     }
 
@@ -274,7 +275,7 @@ fn exec_try(
                     target,
                 );
 
-                let mut args = args
+                let args = args
                     .iter()
                     .map(|a| {
                         expression(
@@ -294,8 +295,8 @@ fn exec_try(
 
                 let address = function.external_function_address();
 
-                args.insert(0, selector);
-                let (payload, _) = abi_encode(loc, args, ns, vartab, cfg, false);
+                let (payload, _) =
+                    target.abi_encode_with_selector(loc, selector, args, ns, vartab, cfg);
 
                 let flags = call_args.flags.as_ref().map(|expr| {
                     expression(
@@ -492,8 +493,8 @@ fn insert_catch_clauses(
     let cond_enough_data = Expression::More {
         loc: Codegen,
         signed: false,
-        left: ret_data_len.into(),
-        right: selector_data_len.into(),
+        left: ret_data_len.clone().into(),
+        right: selector_data_len.clone().into(),
     };
     let instruction = Instr::BranchCond {
         cond: cond_enough_data,
@@ -510,13 +511,40 @@ fn insert_catch_clauses(
             let clause_body_block = cfg.new_basic_block(format!("catch_error_{n}"));
 
             cfg.set_basic_block(clause_body_block);
-            let types = &[Type::Bytes(4), clause.param.as_ref().unwrap().ty.clone()];
+            let param_ty = clause.param.as_ref().unwrap().ty.clone();
+            // In the Ethereum ABI the data after the selector is a tuple of its own.
+            let expr = if ns.target == Target::Riscv {
+                let data = Expression::AdvancePointer {
+                    pointer: buffer.clone().into(),
+                    bytes_offset: selector_data_len.clone().into(),
+                };
+                let size = Expression::Subtract {
+                    loc: Codegen,
+                    ty: Uint(32),
+                    overflowing: true,
+                    left: ret_data_len.clone().into(),
+                    right: selector_data_len.clone().into(),
+                };
+                abi_decode(
+                    &Codegen,
+                    &data,
+                    std::slice::from_ref(&param_ty),
+                    ns,
+                    vartab,
+                    cfg,
+                    Some(size),
+                )[0]
+                .clone()
+            } else {
+                let types = &[Type::Bytes(4), param_ty.clone()];
+                abi_decode(&Codegen, &buffer, types, ns, vartab, cfg, None)[1].clone()
+            };
             let instruction = Instr::Set {
                 loc: Codegen,
                 res: clause
                     .param_pos
-                    .unwrap_or_else(|| vartab.temp_anonymous(&clause.param.as_ref().unwrap().ty)),
-                expr: abi_decode(&Codegen, &buffer, types, ns, vartab, cfg, None)[1].clone(),
+                    .unwrap_or_else(|| vartab.temp_anonymous(&param_ty)),
+                expr,
             };
             cfg.add(vartab, instruction);
 
