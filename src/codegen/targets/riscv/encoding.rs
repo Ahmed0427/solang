@@ -12,7 +12,7 @@
 
 use crate::codegen::cfg::{ControlFlowGraph, Instr};
 use crate::codegen::interface::TargetCodegen;
-use crate::codegen::revert::{assert_failure, SolidityError};
+use crate::codegen::revert::{assert_failure, PanicCode, SolidityError};
 use crate::codegen::targets::abi::{
     buffer_validator::BufferValidator, load_struct_member, AbiEncoding,
 };
@@ -937,6 +937,37 @@ pub(crate) fn abi_decode(
         };
         let (len, _) =
             encoder.read_from_buffer(buffer, &start, &Uint(256), &mut validator, ns, vartab, cfg);
+        // As solc: a length that could never be allocated is Panic(0x41),
+        // checked before the bounds.
+        let allocatable = cfg.new_basic_block("abi_length_allocatable".into());
+        let too_long = cfg.new_basic_block("abi_length_too_long".into());
+        cfg.add(
+            vartab,
+            Instr::BranchCond {
+                cond: Expression::LessEqual {
+                    loc: Codegen,
+                    signed: false,
+                    left: len.clone().into(),
+                    right: Expression::NumberLiteral {
+                        loc: Codegen,
+                        ty: Uint(256),
+                        value: u64::MAX.into(),
+                    }
+                    .into(),
+                },
+                true_block: allocatable,
+                false_block: too_long,
+            },
+        );
+        cfg.set_basic_block(too_long);
+        assert_failure(
+            &Codegen,
+            SolidityError::Panic(PanicCode::OutOfMemory),
+            ns,
+            cfg,
+            vartab,
+        );
+        cfg.set_basic_block(allocatable);
         // len <= size - 32 - offset
         EthAbiEncoding::require(
             Expression::LessEqual {
