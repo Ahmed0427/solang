@@ -163,6 +163,105 @@ impl RiscvTargetRuntime {
         }
     }
 
+    /// keccak256 of `len` bytes at `data`, as the number whose big-endian
+    /// bytes are the digest (Solidity's `uint256(keccak256(...))`).
+    fn keccak256<'a>(
+        bin: &Binary<'a>,
+        function: FunctionValue<'a>,
+        data: PointerValue<'a>,
+        len: IntValue<'a>,
+    ) -> IntValue<'a> {
+        let i256_ty = bin.context.custom_width_int_type(256);
+        let len = bin
+            .builder
+            .build_int_z_extend_or_bit_cast(len, bin.context.i64_type(), "len")
+            .unwrap();
+        let out = bin.build_alloca(function, i256_ty, "digest");
+        bin.builder
+            .build_call(
+                bin.module.get_function("__sys_keccak256").unwrap(),
+                &[data.into(), len.into(), out.into()],
+                "",
+            )
+            .unwrap();
+        let digest = bin
+            .builder
+            .build_load(i256_ty, out, "digest")
+            .unwrap()
+            .into_int_value();
+        Self::bswap256(bin, digest)
+    }
+
+    fn bswap256<'a>(bin: &Binary<'a>, value: IntValue<'a>) -> IntValue<'a> {
+        bin.builder
+            .build_call(bin.llvm_bswap(256), &[value.into()], "bswap")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value()
+    }
+
+    /// A value type as its 32-byte ABI word: what solc hashes for a mapping key.
+    fn abi_word<'a>(bin: &Binary<'a>, ty: &Type, value: BasicValueEnum<'a>) -> IntValue<'a> {
+        let i256_ty = bin.context.custom_width_int_type(256);
+        let int = || {
+            if value.is_pointer_value() {
+                bin.builder
+                    .build_load(bin.llvm_type(ty), value.into_pointer_value(), "key")
+                    .unwrap()
+                    .into_int_value()
+            } else {
+                value.into_int_value()
+            }
+        };
+        match ty {
+            Type::Int(_) => bin
+                .builder
+                .build_int_s_extend_or_bit_cast(int(), i256_ty, "key")
+                .unwrap(),
+            // bytesN is left-aligned.
+            Type::Bytes(n) => {
+                let word = bin
+                    .builder
+                    .build_int_z_extend_or_bit_cast(int(), i256_ty, "key")
+                    .unwrap();
+                bin.builder
+                    .build_left_shift(word, i256_ty.const_int(256 - 8 * *n as u64, false), "key")
+                    .unwrap()
+            }
+            _ => {
+                Self::check_single_slot(bin, ty);
+                Self::to_slot_word(bin, ty, value)
+            }
+        }
+    }
+
+    /// Store `value` big-endian at `dest`, which need not be aligned.
+    fn store_be256<'a>(
+        bin: &Binary<'a>,
+        function: FunctionValue<'a>,
+        dest: PointerValue<'a>,
+        value: IntValue<'a>,
+    ) {
+        let i256_ty = bin.context.custom_width_int_type(256);
+        let tmp = bin.build_alloca(function, i256_ty, "be_word");
+        bin.builder
+            .build_store(tmp, Self::bswap256(bin, value))
+            .unwrap();
+        bin.builder
+            .build_call(
+                bin.module.get_function("__memcpy").unwrap(),
+                &[
+                    dest.into(),
+                    tmp.into(),
+                    bin.context.i32_type().const_int(32, false).into(),
+                ],
+                "",
+            )
+            .unwrap();
+    }
+
     fn storage_type(bin: &Binary, ty: &Type) -> Type {
         ty.deref_any().clone().unwrap_user_type(bin.ns)
     }
@@ -433,6 +532,10 @@ pub(crate) fn declare_syscalls(bin: &mut Binary) {
     let revert_ty = void_ty.fn_type(&[i8_ptr_ty.into(), i64_ty.into()], false);
     let revert = bin.module.add_function("__sys_revert", revert_ty, None);
     revert.set_linkage(Linkage::External);
+
+    let keccak_ty = void_ty.fn_type(&[i8_ptr_ty.into(), i64_ty.into(), i8_ptr_ty.into()], false);
+    let keccak = bin.module.add_function("__sys_keccak256", keccak_ty, None);
+    keccak.set_linkage(Linkage::External);
 }
 
 impl<'a> TargetRuntime<'a> for RiscvTargetRuntime {
@@ -575,15 +678,88 @@ impl<'a> TargetRuntime<'a> for RiscvTargetRuntime {
         unimplemented!("set_storage_bytes_subscript")
     }
 
+    /// The slot of `mapping[key]`, as solc computes it: for a value type key,
+    /// `keccak256(abi_word(key) ++ slot)`; for `string` and `bytes` keys,
+    /// `keccak256(key_bytes ++ slot)`. The slot is a 32-byte big-endian word.
     fn storage_subscript(
         &self,
-        _bin: &Binary<'a>,
-        _function: FunctionValue<'a>,
-        _ty: &Type,
-        _slot: IntValue<'a>,
-        _index: BasicValueEnum<'a>,
+        bin: &Binary<'a>,
+        function: FunctionValue<'a>,
+        ty: &Type,
+        slot: IntValue<'a>,
+        index: BasicValueEnum<'a>,
     ) -> IntValue<'a> {
-        unimplemented!("storage_subscript")
+        let Type::Mapping(mapping) = ty.deref_any() else {
+            unimplemented!(
+                "the riscv target cannot index `{}` in storage yet",
+                ty.to_string(bin.ns)
+            );
+        };
+        let key_ty = Self::storage_type(bin, &mapping.key);
+        let i32_ty = bin.context.i32_type();
+        let i256_ty = bin.context.custom_width_int_type(256);
+
+        if !matches!(key_ty, Type::String | Type::DynamicBytes) {
+            let preimage = bin.build_alloca(function, i256_ty.array_type(2), "preimage");
+            let words = [Self::abi_word(bin, &key_ty, index), slot];
+            for (i, word) in words.into_iter().enumerate() {
+                let dest = unsafe {
+                    bin.builder
+                        .build_gep(
+                            i256_ty.array_type(2),
+                            preimage,
+                            &[i32_ty.const_zero(), i32_ty.const_int(i as u64, false)],
+                            "word",
+                        )
+                        .unwrap()
+                };
+                bin.builder
+                    .build_store(dest, Self::bswap256(bin, word))
+                    .unwrap();
+            }
+            return Self::keccak256(bin, function, preimage, i32_ty.const_int(64, false));
+        }
+
+        let (key, key_len) = (bin.vector_bytes(index), bin.vector_len(index));
+        let len = bin
+            .builder
+            .build_int_add(key_len, i32_ty.const_int(32, false), "preimage_len")
+            .unwrap();
+        let preimage = bin
+            .builder
+            .build_call(
+                bin.module.get_function("__malloc").unwrap(),
+                &[len.into()],
+                "",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_pointer_value();
+        bin.builder
+            .build_call(
+                bin.module.get_function("__memcpy").unwrap(),
+                &[preimage.into(), key.into(), key_len.into()],
+                "",
+            )
+            .unwrap();
+        let slot_dest = unsafe {
+            bin.builder
+                .build_gep(bin.context.i8_type(), preimage, &[key_len], "slot_dest")
+                .unwrap()
+        };
+        Self::store_be256(bin, function, slot_dest, slot);
+
+        let hash = Self::keccak256(bin, function, preimage, len);
+        bin.builder
+            .build_call(
+                bin.module.get_function("__free").unwrap(),
+                &[preimage.into()],
+                "",
+            )
+            .unwrap();
+        hash
     }
 
     fn storage_push(
@@ -736,14 +912,19 @@ impl<'a> TargetRuntime<'a> for RiscvTargetRuntime {
         unimplemented!("selfdestruct")
     }
 
+    /// `keccak256(bytes)` returns a `bytes32`, which Solang keeps as the
+    /// number whose big-endian bytes are the digest.
     fn hash<'b>(
         &self,
-        _bin: &Binary<'b>,
-        _function: FunctionValue<'b>,
-        _hash: HashTy,
-        _string: PointerValue<'b>,
-        _length: IntValue<'b>,
+        bin: &Binary<'b>,
+        function: FunctionValue<'b>,
+        hash: HashTy,
+        string: PointerValue<'b>,
+        length: IntValue<'b>,
     ) -> IntValue<'b> {
-        unimplemented!("hash")
+        if !matches!(hash, HashTy::Keccak256) {
+            unimplemented!("the riscv target has no {hash} syscall yet");
+        }
+        Self::keccak256(bin, function, string, length)
     }
 }
