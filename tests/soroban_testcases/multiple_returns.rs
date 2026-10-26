@@ -199,3 +199,39 @@ fn spec_has_one_tuple_output() {
     );
     assert_eq!(composite[2], ScSpecTypeDef::U64);
 }
+
+#[test]
+#[ignore = "calls through internal function pointers are not supported on Soroban yet, even with one return value"]
+fn function_pointer_call_returns_all_values() {
+    let runtime = build_solidity(
+        r#"contract test {
+            function first(uint64 x) internal pure returns (uint64, uint64) {
+                return (x, x + 1);
+            }
+
+            function second(uint64 x) internal pure returns (uint64, uint64) {
+                return (x * 2, x * 3);
+            }
+
+            function via_pointer(uint64 x, bool pick_first) public pure returns (uint64, uint64) {
+                function(uint64) internal pure returns (uint64, uint64) f = second;
+                if (pick_first) {
+                    f = first;
+                }
+                (uint64 a, uint64 b) = f(x);
+                return (a, b);
+            }
+        }"#,
+        |_| {},
+    );
+    let addr = runtime.contracts.last().unwrap();
+    let env = &runtime.env;
+
+    let args = vec![5_u64.into_val(env), true.into_val(env)];
+    let res = runtime.invoke_contract(addr, "via_pointer", args);
+    assert_eq!(<(u64, u64)>::try_from_val(env, &res).unwrap(), (5, 6));
+
+    let args = vec![5_u64.into_val(env), false.into_val(env)];
+    let res = runtime.invoke_contract(addr, "via_pointer", args);
+    assert_eq!(<(u64, u64)>::try_from_val(env, &res).unwrap(), (10, 15));
+}
